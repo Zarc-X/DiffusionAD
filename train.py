@@ -1,7 +1,10 @@
 from random import seed
+import argparse
 import torch
 import os
 import json
+import time
+import tempfile
 import matplotlib.pyplot as plt
 import numpy as np
 from torch import optim
@@ -16,7 +19,7 @@ import torch.nn.functional as F
 from models.DDPM import GaussianDiffusionModel, get_beta_schedule
 from scipy.ndimage import gaussian_filter
 from skimage.measure import label, regionprops
-from sklearn.metrics import roc_auc_score,auc,average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 import pandas as pd
 from collections import defaultdict
 
@@ -55,6 +58,100 @@ class BinaryFocalLoss(nn.Module):
         else:
             return F_loss
 
+
+def safe_auroc(y_true, y_score):
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return round(roc_auc_score(y_true, y_score), 3) * 100
+
+
+def safe_ap(y_true, y_score):
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return round(average_precision_score(y_true, y_score), 3) * 100
+
+
+def safe_best_f1(y_true, y_score):
+    if len(np.unique(y_true)) < 2:
+        return float("nan"), float("nan")
+
+    precision, recall, thresholds = precision_recall_curve(y_true, y_score)
+    denom = precision + recall
+    f1_scores = np.where(denom > 0, 2 * precision * recall / denom, 0.0)
+    best_idx = int(np.nanargmax(f1_scores))
+    best_f1 = round(float(f1_scores[best_idx]), 3) * 100
+
+    if thresholds.size == 0:
+        best_threshold = float("nan")
+    else:
+        threshold_idx = min(best_idx, thresholds.size - 1)
+        best_threshold = round(float(thresholds[threshold_idx]), 6)
+
+    return best_f1, best_threshold
+
+
+def get_arg_int(args, key, default):
+    value = args[key]
+    if value == '' or value is None:
+        return default
+    return int(value)
+
+
+def get_arg_float(args, key, default):
+    value = args[key]
+    if value == '' or value is None:
+        return default
+    return float(value)
+
+
+def build_monitor_score(metrics, args):
+    weighted_terms = [
+        ("image_auroc", get_arg_float(args, "early_stop_w_image_auroc", 1.0)),
+        ("pixel_auroc", get_arg_float(args, "early_stop_w_pixel_auroc", 1.0)),
+        ("image_ap", get_arg_float(args, "early_stop_w_image_ap", 1.0)),
+        ("pixel_ap", get_arg_float(args, "early_stop_w_pixel_ap", 1.0)),
+        ("image_f1", get_arg_float(args, "early_stop_w_image_f1", 1.0)),
+        ("pixel_f1", get_arg_float(args, "early_stop_w_pixel_f1", 1.0)),
+    ]
+
+    score = 0.0
+    used_count = 0
+    for metric_name, weight in weighted_terms:
+        if weight == 0:
+            continue
+        value = metrics.get(metric_name, float("nan"))
+        if np.isfinite(value):
+            score += weight * float(value)
+            used_count += 1
+
+    if used_count == 0:
+        return float("-inf")
+    return score
+
+
+def configure_runtime_environment(args):
+    requested_tmp = args["mp_tmp_root"]
+    if requested_tmp:
+        tmp_root = requested_tmp
+    elif os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK | os.X_OK):
+        tmp_root = "/dev/shm/diffusionad_mp_tmp"
+    else:
+        tmp_root = os.path.join(os.getcwd(), ".diffusionad_mp_tmp")
+
+    os.makedirs(tmp_root, exist_ok=True)
+    os.environ["TMPDIR"] = tmp_root
+    os.environ["TMP"] = tmp_root
+    os.environ["TEMP"] = tmp_root
+    tempfile.tempdir = tmp_root
+
+    sharing_strategy = args["torch_sharing_strategy"] if args["torch_sharing_strategy"] else "file_system"
+    try:
+        torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+    except RuntimeError as e:
+        print(f"[runtime] warning: failed to set torch sharing strategy to {sharing_strategy}: {e}")
+
+    print(f"[runtime] tmpdir={tmp_root}, torch_sharing_strategy={sharing_strategy}")
+
 def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_class,class_type,device ):
    
     in_channels = args["channels"]
@@ -85,7 +182,15 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     
 
     tqdm_epoch = range(0, args['EPOCHS'] )
-    scheduler_seg =optim.lr_scheduler.CosineAnnealingLR(optimizer_seg, T_max=10, eta_min=0, last_epoch=- 1, verbose=False)
+    try:
+        scheduler_seg =optim.lr_scheduler.CosineAnnealingLR(optimizer_seg, T_max=10, eta_min=0, last_epoch=- 1, verbose=False)
+    except TypeError:
+        scheduler_seg =optim.lr_scheduler.CosineAnnealingLR(optimizer_seg, T_max=10, eta_min=0, last_epoch=- 1)
+
+    eval_interval = max(1, get_arg_int(args, 'eval_interval', 50))
+    early_stop_patience = max(0, get_arg_int(args, 'early_stop_patience', 0))
+    early_stop_min_delta = max(0.0, get_arg_float(args, 'early_stop_min_delta', 0.0))
+    early_stop_warmup_evals = max(0, get_arg_int(args, 'early_stop_warmup_evals', 0))
     
     # dataset loop
     train_loss_list=[]
@@ -96,11 +201,46 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
     best_image_auroc=0.0
     best_pixel_auroc=0.0
     best_epoch=0
+    best_score=float('-inf')
+    no_improve_evals=0
+    eval_count=0
+    early_stopped=False
+    last_epoch_ran=0
+    best_eval_metrics = {
+        "image_ap": float("nan"),
+        "pixel_ap": float("nan"),
+        "image_f1": float("nan"),
+        "pixel_f1": float("nan"),
+        "image_f1_threshold": float("nan"),
+        "pixel_f1_threshold": float("nan"),
+        "fps": float("nan"),
+        "ms_per_img": float("nan"),
+    }
     image_auroc_list=[]
     pixel_auroc_list=[]
     performance_x_list=[]
+    eval_history_csv = f"{args['output_path']}/metrics/ARGS={args['arg_num']}/{sub_class}_eval_history.csv"
+
+    if early_stop_patience > 0:
+        print(
+            f"[{sub_class}] Early stopping enabled: "
+            f"patience={early_stop_patience} evals, min_delta={early_stop_min_delta}, "
+            f"warmup_evals={early_stop_warmup_evals}, eval_interval={eval_interval}"
+        )
+        print(
+            f"[{sub_class}] Monitor weights: "
+            f"img_auc={get_arg_float(args, 'early_stop_w_image_auroc', 1.0)}, "
+            f"px_auc={get_arg_float(args, 'early_stop_w_pixel_auroc', 1.0)}, "
+            f"img_ap={get_arg_float(args, 'early_stop_w_image_ap', 1.0)}, "
+            f"px_ap={get_arg_float(args, 'early_stop_w_pixel_ap', 1.0)}, "
+            f"img_f1={get_arg_float(args, 'early_stop_w_image_f1', 1.0)}, "
+            f"px_f1={get_arg_float(args, 'early_stop_w_pixel_f1', 1.0)}"
+        )
+    else:
+        print(f"[{sub_class}] Early stopping disabled (early_stop_patience=0), eval_interval={eval_interval}")
     
     for epoch in tqdm_epoch:
+        last_epoch_ran = epoch + 1
         unet_model.train()
         seg_model.train()
         train_loss = 0.0
@@ -146,26 +286,110 @@ def train(training_dataset_loader, testing_dataset_loader, args, data_len,sub_cl
             loss_x_list.append(int(epoch))
 
 
-        if (epoch+1) % 50==0 and epoch > 0:
-            temp_image_auroc,temp_pixel_auroc= eval(testing_dataset_loader,args,unet_model,seg_model,data_len,sub_class,device)
+        if (epoch+1) % eval_interval==0 and epoch > 0:
+            eval_metrics = eval(testing_dataset_loader,args,unet_model,seg_model,data_len,sub_class,device)
+            eval_count += 1
+            temp_image_auroc = eval_metrics["image_auroc"]
+            temp_pixel_auroc = eval_metrics["pixel_auroc"]
+            monitor_score = build_monitor_score(eval_metrics, args)
             image_auroc_list.append(temp_image_auroc)
             pixel_auroc_list.append(temp_pixel_auroc)
             performance_x_list.append(int(epoch))
-            if(temp_image_auroc+temp_pixel_auroc>=best_image_auroc+best_pixel_auroc):
-                if temp_image_auroc>=best_image_auroc:
-                    save(unet_model,seg_model, args=args,final='best',epoch=epoch,sub_class=sub_class)
-                    best_image_auroc = temp_image_auroc
-                    best_pixel_auroc = temp_pixel_auroc
-                    best_epoch = epoch
+
+            monitor_score_text = f"{monitor_score:.2f}" if np.isfinite(monitor_score) else "nan"
+
+            print(
+                f"[{sub_class}] Epoch {epoch + 1}/{args['EPOCHS']} | "
+                f"Image-AUROC: {temp_image_auroc:.2f} | Pixel-AUROC: {temp_pixel_auroc:.2f} | "
+                f"Image-AP: {eval_metrics['image_ap']:.2f} | Pixel-AP: {eval_metrics['pixel_ap']:.2f} | "
+                f"Image-BestF1: {eval_metrics['image_f1']:.2f} | Pixel-BestF1: {eval_metrics['pixel_f1']:.2f} | "
+                f"Monitor-Score: {monitor_score_text} | "
+                f"FPS: {eval_metrics['fps']:.2f} | ms/img: {eval_metrics['ms_per_img']:.2f}"
+            )
+
+            eval_row = {
+                "classname": sub_class,
+                "class_type": class_type,
+                "epoch": epoch + 1,
+                "Image-AUROC": temp_image_auroc,
+                "Pixel-AUROC": temp_pixel_auroc,
+                "Image-AP": eval_metrics["image_ap"],
+                "Pixel-AP": eval_metrics["pixel_ap"],
+                "Image-F1": eval_metrics["image_f1"],
+                "Pixel-F1": eval_metrics["pixel_f1"],
+                "Image-BestThreshold": eval_metrics["image_f1_threshold"],
+                "Pixel-BestThreshold": eval_metrics["pixel_f1_threshold"],
+                "Eval-FPS": eval_metrics["fps"],
+                "Eval-ms-per-img": eval_metrics["ms_per_img"],
+            }
+            pd.DataFrame([eval_row]).to_csv(
+                eval_history_csv,
+                mode='a',
+                header=not os.path.exists(eval_history_csv),
+                index=False,
+            )
+
+            current_score = monitor_score
+            is_improved = np.isfinite(current_score) and (current_score > best_score + early_stop_min_delta)
+
+            if is_improved:
+                save(unet_model,seg_model, args=args,final='best',epoch=epoch + 1,sub_class=sub_class)
+                best_image_auroc = temp_image_auroc
+                best_pixel_auroc = temp_pixel_auroc
+                best_epoch = epoch + 1
+                best_score = current_score
+                no_improve_evals = 0
+                best_eval_metrics = {
+                    "image_ap": eval_metrics["image_ap"],
+                    "pixel_ap": eval_metrics["pixel_ap"],
+                    "image_f1": eval_metrics["image_f1"],
+                    "pixel_f1": eval_metrics["pixel_f1"],
+                    "image_f1_threshold": eval_metrics["image_f1_threshold"],
+                    "pixel_f1_threshold": eval_metrics["pixel_f1_threshold"],
+                    "fps": eval_metrics["fps"],
+                    "ms_per_img": eval_metrics["ms_per_img"],
+                }
+            else:
+                no_improve_evals += 1
+
+            if (
+                early_stop_patience > 0
+                and eval_count > early_stop_warmup_evals
+                and no_improve_evals >= early_stop_patience
+            ):
+                print(
+                    f"[{sub_class}] Early stopping triggered at epoch {epoch + 1}: "
+                    f"no improvement for {no_improve_evals} evals "
+                    f"(patience={early_stop_patience}, min_delta={early_stop_min_delta})."
+                )
+                early_stopped = True
+                break
                 
             
-    save(unet_model,seg_model, args=args,final='last',epoch=args['EPOCHS'],sub_class=sub_class)
+    save(unet_model,seg_model, args=args,final='last',epoch=last_epoch_ran,sub_class=sub_class)
+
+    if early_stopped:
+        print(f"[{sub_class}] Training stopped early at epoch {last_epoch_ran}/{args['EPOCHS']}.")
 
 
 
-    temp = {"classname":[sub_class],"Image-AUROC": [best_image_auroc],"Pixel-AUROC":[best_pixel_auroc],"epoch":best_epoch}
+    temp = {
+        "classname": [sub_class],
+        "Image-AUROC": [best_image_auroc],
+        "Pixel-AUROC": [best_pixel_auroc],
+        "Image-AP": [best_eval_metrics["image_ap"]],
+        "Pixel-AP": [best_eval_metrics["pixel_ap"]],
+        "Image-F1": [best_eval_metrics["image_f1"]],
+        "Pixel-F1": [best_eval_metrics["pixel_f1"]],
+        "Image-BestThreshold": [best_eval_metrics["image_f1_threshold"]],
+        "Pixel-BestThreshold": [best_eval_metrics["pixel_f1_threshold"]],
+        "Eval-FPS": [best_eval_metrics["fps"]],
+        "Eval-ms-per-img": [best_eval_metrics["ms_per_img"]],
+        "epoch": [best_epoch],
+    }
     df_class = pd.DataFrame(temp)
-    df_class.to_csv(f"{args['output_path']}/metrics/ARGS={args['arg_num']}/{args['eval_normal_t']}_{args['eval_noisier_t']}t_{args['condition_w']}_{class_type}_image_pixel_auroc_train.csv", mode='a',header=False,index=False)
+    out_csv = f"{args['output_path']}/metrics/ARGS={args['arg_num']}/{args['eval_normal_t']}_{args['eval_noisier_t']}t_{args['condition_w']}_{class_type}_image_pixel_auroc_train.csv"
+    df_class.to_csv(out_csv, mode='a', header=not os.path.exists(out_csv), index=False)
    
     
 
@@ -181,47 +405,75 @@ def eval(testing_dataset_loader,args,unet_model,seg_model,data_len,sub_class,dev
             loss_type=args['loss-type'], noise=args["noise_fn"], img_channels=in_channels
             )
     
-    print("data_len",data_len)
     total_image_pred = np.array([])
     total_image_gt =np.array([])
     total_pixel_gt=np.array([])
     total_pixel_pred = np.array([])
-    tbar = tqdm(testing_dataset_loader)
-    for i, sample in enumerate(tbar):
-        image = sample["image"].to(device)
-        target=sample['has_anomaly'].to(device)
-        gt_mask = sample["mask"].to(device)
+    total_infer_time = 0.0
+    total_images = 0
 
-        normal_t_tensor = torch.tensor([args["eval_normal_t"]], device=image.device).repeat(image.shape[0])
-        noiser_t_tensor = torch.tensor([args["eval_noisier_t"]], device=image.device).repeat(image.shape[0])
-        loss,pred_x_0_condition,pred_x_0_normal,pred_x_0_noisier,x_normal_t,x_noiser_t,pred_x_t_noisier = ddpm_sample.norm_guided_one_step_denoising_eval(unet_model, image, normal_t_tensor,noiser_t_tensor,args)
-        pred_mask = seg_model(torch.cat((image, pred_x_0_condition), dim=1)) 
+    with torch.no_grad():
+        tbar = tqdm(testing_dataset_loader, desc=f"{sub_class} Eval", leave=False)
+        for i, sample in enumerate(tbar):
+            image = sample["image"].to(device)
+            target=sample['has_anomaly'].to(device)
+            gt_mask = sample["mask"].to(device)
 
-        out_mask = pred_mask
+            normal_t_tensor = torch.tensor([args["eval_normal_t"]], device=image.device).repeat(image.shape[0])
+            noiser_t_tensor = torch.tensor([args["eval_noisier_t"]], device=image.device).repeat(image.shape[0])
 
-        topk_out_mask = torch.flatten(out_mask[0], start_dim=1)
-        topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
-        image_score = torch.mean(topk_out_mask)
-        
-        total_image_pred=np.append(total_image_pred,image_score.detach().cpu().numpy())
-        total_image_gt=np.append(total_image_gt,target[0].detach().cpu().numpy())
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            infer_start = time.perf_counter()
 
+            loss,pred_x_0_condition,pred_x_0_normal,pred_x_0_noisier,x_normal_t,x_noiser_t,pred_x_t_noisier = ddpm_sample.norm_guided_one_step_denoising_eval(unet_model, image, normal_t_tensor,noiser_t_tensor,args)
+            pred_mask = seg_model(torch.cat((image, pred_x_0_condition), dim=1)) 
 
-        flatten_pred_mask=out_mask[0].flatten().detach().cpu().numpy()
-        flatten_gt_mask =gt_mask[0].flatten().detach().cpu().numpy().astype(int)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            infer_end = time.perf_counter()
+
+            total_infer_time += infer_end - infer_start
+            total_images += int(image.shape[0])
+            if total_infer_time > 0:
+                tbar.set_postfix(fps=f"{(total_images / total_infer_time):.2f}")
+
+            out_mask = pred_mask
+
+            topk_out_mask = torch.flatten(out_mask[0], start_dim=1)
+            topk_out_mask = torch.topk(topk_out_mask, 50, dim=1, largest=True)[0]
+            image_score = torch.mean(topk_out_mask)
             
-        total_pixel_gt=np.append(total_pixel_gt,flatten_gt_mask)
-        total_pixel_pred=np.append(total_pixel_pred,flatten_pred_mask)
-        
-        
-    print(sub_class)
-    auroc_image = round(roc_auc_score(total_image_gt,total_image_pred),3)*100
-    print("Image AUC-ROC: " ,auroc_image)
-    
-    auroc_pixel =  round(roc_auc_score(total_pixel_gt, total_pixel_pred),3)*100
-    print("Pixel AUC-ROC:" ,auroc_pixel)
-   
-    return auroc_image,auroc_pixel
+            total_image_pred=np.append(total_image_pred,image_score.detach().cpu().numpy())
+            total_image_gt=np.append(total_image_gt,target[0].detach().cpu().numpy())
+
+
+            flatten_pred_mask=out_mask[0].flatten().detach().cpu().numpy()
+            flatten_gt_mask =gt_mask[0].flatten().detach().cpu().numpy().astype(int)
+                
+            total_pixel_gt=np.append(total_pixel_gt,flatten_gt_mask)
+            total_pixel_pred=np.append(total_pixel_pred,flatten_pred_mask)
+
+    metrics = {
+        "image_auroc": safe_auroc(total_image_gt,total_image_pred),
+        "pixel_auroc": safe_auroc(total_pixel_gt, total_pixel_pred),
+        "image_ap": safe_ap(total_image_gt, total_image_pred),
+        "pixel_ap": safe_ap(total_pixel_gt, total_pixel_pred),
+    }
+    metrics["image_f1"], metrics["image_f1_threshold"] = safe_best_f1(total_image_gt, total_image_pred)
+    metrics["pixel_f1"], metrics["pixel_f1_threshold"] = safe_best_f1(total_pixel_gt, total_pixel_pred)
+
+    if total_infer_time > 0:
+        metrics["fps"] = total_images / total_infer_time
+    else:
+        metrics["fps"] = float("nan")
+
+    if total_images > 0:
+        metrics["ms_per_img"] = (total_infer_time / total_images) * 1000.0
+    else:
+        metrics["ms_per_img"] = float("nan")
+
+    return metrics
 
 
 def save(unet_model,seg_model, args,final,epoch,sub_class):
@@ -249,18 +501,37 @@ def save(unet_model,seg_model, args,final,epoch,sub_class):
     
 
 def main():
+    parser = argparse.ArgumentParser(description="Train DiffusionAD baseline")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="args1.json",
+        help="Config filename under args/ or absolute path",
+    )
+    cli_args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # read file from argument
-    file = "args1.json"
+    file = cli_args.config
     # load the json args
-    with open(f'./args/{file}', 'r') as f:
+    if os.path.isabs(file):
+        config_path = file
+    elif os.path.exists(file):
+        config_path = file
+    else:
+        config_path = os.path.join("./args", file)
+
+    with open(config_path, 'r') as f:
         args = json.load(f)
-    args['arg_num'] = file[4:-5]
+    base_name = os.path.basename(config_path)
+    args['arg_num'] = os.path.splitext(base_name)[0].replace('args', '').strip('_')
+    if not args['arg_num']:
+        args['arg_num'] = os.path.splitext(base_name)[0]
     args = defaultdict_from_json(args)
+    configure_runtime_environment(args)
 
 
-    mvtec_classes = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut', 'pill', 'screw',
-            'toothbrush', 'transistor', 'zipper']
+    mvtec_classes = ['carpet', 'cable', 'capsule', 'screw', 'transistor']
     
     visa_classes = ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1', 'macaroni2', 'pcb1', 'pcb2',
              'pcb3', 'pcb4', 'pipe_fryum']
@@ -316,8 +587,29 @@ def main():
         print(file, args)     
 
         data_len = len(testing_dataset) 
-        training_dataset_loader = DataLoader(training_dataset, batch_size=args['Batch_Size'],shuffle=True,num_workers=8,pin_memory=True,drop_last=True)
-        test_loader = DataLoader(testing_dataset, batch_size=1,shuffle=False, num_workers=4)
+        num_workers_train = max(0, get_arg_int(args, 'num_workers_train', 8))
+        num_workers_test = max(0, get_arg_int(args, 'num_workers_test', 4))
+
+        train_loader_kwargs = {
+            "batch_size": args['Batch_Size'],
+            "shuffle": True,
+            "num_workers": num_workers_train,
+            "pin_memory": True,
+            "drop_last": True,
+        }
+        if num_workers_train > 0:
+            train_loader_kwargs["persistent_workers"] = True
+
+        test_loader_kwargs = {
+            "batch_size": 1,
+            "shuffle": False,
+            "num_workers": num_workers_test,
+        }
+        if num_workers_test > 0:
+            test_loader_kwargs["persistent_workers"] = True
+
+        training_dataset_loader = DataLoader(training_dataset, **train_loader_kwargs)
+        test_loader = DataLoader(testing_dataset, **test_loader_kwargs)
 
         # make arg specific directories
         for i in [f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}',

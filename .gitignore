@@ -1,0 +1,16 @@
+# logs and files
+*.log
+*.pdf
+
+# vscode
+.vscode/
+
+# python 
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+
+MambaAD/
+datasets/
+outputs*/
