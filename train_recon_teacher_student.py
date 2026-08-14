@@ -26,6 +26,7 @@ import pandas as pd
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch import optim
 from torch.utils.data import DataLoader
@@ -44,7 +45,16 @@ from data.dataset_beta_thresh import (
     MPDDTrainDataset,
 )
 from models.DDPM import GaussianDiffusionModel, get_beta_schedule, extract, mean_flat
-from models.Recon_subnetwork import UNetModel
+from models.Recon_dualbranch import ReconDualBranchModel
+
+
+def set_global_seed(seed_value):
+    seed_value = int(seed_value)
+    seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
 
 
 def resolve_config_path(config_arg: str) -> str:
@@ -125,6 +135,19 @@ def parse_channel_mults(value, fallback):
             return tuple(int(v) for v in fallback)
         return tuple(int(v.strip()) for v in value.split(",") if v.strip())
     raise ValueError(f"Unsupported channel_mults type: {type(value)}")
+
+
+def parse_int_list(value, fallback):
+    if value == "" or value is None:
+        return [int(v) for v in fallback]
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return [int(v) for v in fallback]
+        return [int(v.strip()) for v in value.split(",") if v.strip()]
+    raise ValueError(f"Unsupported integer list type: {type(value)}")
 
 
 def is_main_process(rank):
@@ -220,12 +243,12 @@ def safe_best_f1(y_true, y_score):
 
 def build_monitor_score(metrics, args):
     weighted_terms = [
-        ("image_auroc", get_arg_float(args, "early_stop_w_image_auroc", 1.0)),
+        ("image_auroc", get_arg_float(args, "early_stop_w_image_auroc", 0.5)),
         ("pixel_auroc", get_arg_float(args, "early_stop_w_pixel_auroc", 1.0)),
-        ("image_ap", get_arg_float(args, "early_stop_w_image_ap", 1.0)),
-        ("pixel_ap", get_arg_float(args, "early_stop_w_pixel_ap", 1.0)),
-        ("image_f1", get_arg_float(args, "early_stop_w_image_f1", 1.0)),
-        ("pixel_f1", get_arg_float(args, "early_stop_w_pixel_f1", 1.0)),
+        ("image_ap", get_arg_float(args, "early_stop_w_image_ap", 0.5)),
+        ("pixel_ap", get_arg_float(args, "early_stop_w_pixel_ap", 1.5)),
+        ("image_f1", get_arg_float(args, "early_stop_w_image_f1", 0.5)),
+        ("pixel_f1", get_arg_float(args, "early_stop_w_pixel_f1", 1.5)),
     ]
 
     score = 0.0
@@ -291,6 +314,182 @@ def build_residual_anomaly_map(image, recon, args):
     raise ValueError(f"Unknown test_anomaly_map_mode: {mode}")
 
 
+def tensor_minmax_norm(x, eps=1e-6):
+    shape = x.shape
+    flat = x.view(shape[0], -1)
+    mins = flat.min(dim=1)[0].view(shape[0], *([1] * (len(shape) - 1)))
+    maxs = flat.max(dim=1)[0].view(shape[0], *([1] * (len(shape) - 1)))
+    return (x - mins) / (maxs - mins + eps)
+
+
+def gradient_magnitude_map(x):
+    # Use grayscale Sobel gradients as structure target.
+    gray = torch.mean(x, dim=1, keepdim=True)
+    sobel_x = torch.tensor(
+        [[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 1, 3, 3)
+    sobel_y = torch.tensor(
+        [[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]],
+        device=x.device,
+        dtype=x.dtype,
+    ).view(1, 1, 3, 3)
+    gx = F.conv2d(gray, sobel_x, padding=1)
+    gy = F.conv2d(gray, sobel_y, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-6)
+
+
+def model_last_feature(model):
+    core = unwrap_model(model)
+    if hasattr(core, "get_last_feature"):
+        return core.get_last_feature()
+    return None
+
+
+def predict_structure_map(model, recon):
+    core = unwrap_model(model)
+    if not hasattr(core, "predict_structure"):
+        raise AttributeError("Model has no predict_structure method")
+    return core.predict_structure(recon)
+
+
+def has_segmentation_head(model):
+    core = unwrap_model(model)
+    if hasattr(core, "has_segmentation_head"):
+        return bool(core.has_segmentation_head())
+    return False
+
+
+def predict_segmentation_logits(model, recon, image):
+    core = unwrap_model(model)
+    if not hasattr(core, "predict_segmentation"):
+        return None
+    if has_segmentation_head(core):
+        return core.predict_segmentation(recon, image=image, return_logits=True)
+    return None
+
+
+def dice_loss_from_logits(seg_logits, seg_target, eps=1e-6):
+    seg_prob = torch.sigmoid(seg_logits)
+    seg_target = seg_target.to(dtype=seg_prob.dtype)
+
+    intersection = (seg_prob * seg_target).sum(dim=(1, 2, 3))
+    denom = seg_prob.sum(dim=(1, 2, 3)) + seg_target.sum(dim=(1, 2, 3))
+    dice = (2.0 * intersection + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
+
+def build_topk_mask(score_map, valid_mask, ratio):
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    if ratio <= 0:
+        return torch.zeros_like(score_map)
+
+    bsz = score_map.shape[0]
+    out_mask = torch.zeros_like(score_map)
+    score_flat = score_map.view(bsz, -1)
+    valid_flat = (valid_mask > 0).view(bsz, -1)
+
+    out_mask_flat = out_mask.view(bsz, -1)
+    for b in range(bsz):
+        valid_idx = torch.nonzero(valid_flat[b], as_tuple=False).squeeze(1)
+        if valid_idx.numel() == 0:
+            continue
+
+        k = max(1, int(round(valid_idx.numel() * ratio)))
+        k = min(k, int(valid_idx.numel()))
+        local_scores = score_flat[b, valid_idx]
+        top_local_idx = torch.topk(local_scores, k=k, largest=True).indices
+        selected = valid_idx[top_local_idx]
+        out_mask_flat[b, selected] = 1.0
+
+    return out_mask
+
+
+def build_fused_anomaly_map(image, recon, structure_pred, args, seg_prob=None):
+    base_map = build_residual_anomaly_map(image, recon, args)
+    use_structure = get_arg_bool(args, "use_structure_branch", True)
+    use_seg = seg_prob is not None
+
+    if not use_structure and not use_seg:
+        return base_map
+
+    components = []
+    weights = []
+
+    base_map = tensor_minmax_norm(base_map)
+    residual_w = get_arg_float(args, "anomaly_fusion_residual_w", get_arg_float(args, "anomaly_fusion_alpha", 0.7))
+    components.append(base_map)
+    weights.append(max(float(residual_w), 0.0))
+
+    if use_structure:
+        structure_target = gradient_magnitude_map(image)
+        structure_residual = torch.abs(structure_target - structure_pred)
+        structure_residual = tensor_minmax_norm(structure_residual)
+        structure_w = get_arg_float(
+            args,
+            "anomaly_fusion_structure_w",
+            1.0 - get_arg_float(args, "anomaly_fusion_alpha", 0.7),
+        )
+        components.append(structure_residual)
+        weights.append(max(float(structure_w), 0.0))
+
+    if use_seg:
+        seg_norm = tensor_minmax_norm(seg_prob)
+        seg_w = get_arg_float(args, "anomaly_fusion_seg_w", 0.25)
+        components.append(seg_norm)
+        weights.append(max(float(seg_w), 0.0))
+
+    weight_sum = float(sum(weights))
+    if weight_sum <= 0:
+        weights = [1.0 / len(components)] * len(components)
+    else:
+        weights = [w / weight_sum for w in weights]
+
+    fused = torch.zeros_like(components[0])
+    for w, comp in zip(weights, components):
+        fused = fused + float(w) * comp
+    return fused
+
+
+def per_sample_quantile(x, q):
+    q = float(np.clip(q, 0.0, 1.0))
+    flat = x.view(x.shape[0], -1)
+    sorted_flat, _ = torch.sort(flat, dim=1)
+    if sorted_flat.shape[1] == 1:
+        return sorted_flat[:, :1].view(x.shape[0], *([1] * (len(x.shape) - 1)))
+
+    q_index = int(round(q * float(sorted_flat.shape[1] - 1)))
+    q_index = max(0, min(q_index, sorted_flat.shape[1] - 1))
+    return sorted_flat[:, q_index : q_index + 1].view(x.shape[0], *([1] * (len(x.shape) - 1)))
+
+
+def weighted_smooth_l1(pred, target, weight_map=None):
+    loss_map = F.smooth_l1_loss(pred, target, reduction="none")
+    if weight_map is None:
+        return loss_map.mean()
+
+    weights = weight_map.to(dtype=loss_map.dtype)
+    weighted_loss = loss_map * weights
+    denom = torch.clamp(weights.sum(), min=1e-6)
+    return weighted_loss.sum() / denom
+
+
+def build_teacher_guided_maps(teacher_anomaly_map, anomaly_label, normal_mask_quantile, conf_tau, conf_gain):
+    teacher_norm = tensor_minmax_norm(teacher_anomaly_map.detach())
+    normal_sample_mask = (anomaly_label == 0).to(teacher_norm.dtype).view(-1, 1, 1, 1)
+
+    # Only trust low-score teacher regions as pseudo-normal anchors.
+    normal_threshold = per_sample_quantile(teacher_norm, normal_mask_quantile)
+    normal_region_mask = (teacher_norm <= normal_threshold).to(teacher_norm.dtype) * normal_sample_mask
+
+    conf_tau = max(float(conf_tau), 1e-6)
+    conf_gain = max(float(conf_gain), 0.0)
+    teacher_confidence = torch.exp(-teacher_norm / conf_tau)
+    kd_weight_map = 1.0 + conf_gain * teacher_confidence * normal_sample_mask
+    return normal_region_mask, kd_weight_map
+
+
 def diffusion_loss_vector(loss_type, estimate_noise, noise):
     if loss_type == "l1":
         return mean_flat((estimate_noise - noise).abs())
@@ -320,6 +519,7 @@ def norm_guided_forward_shared(
     x_noisier_t = ddpm_sample.sample_q(x_0, noisier_t, noise_noisier)
 
     estimate_noise_normal = model(x_normal_t, normal_t)
+    feature_normal = model_last_feature(model)
     estimate_noise_noisier = model(x_noisier_t, noisier_t)
 
     normal_loss_vec = diffusion_loss_vector(ddpm_sample.loss_type, estimate_noise_normal, noise_normal)
@@ -342,7 +542,7 @@ def norm_guided_forward_shared(
     ) * args["condition_w"] * (pred_x_t_noisier - x_normal_t)
     pred_x_0_norm_guided = ddpm_sample.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
 
-    return noise_loss, pred_x_0_norm_guided
+    return noise_loss, pred_x_0_norm_guided, feature_normal
 
 
 def evaluate_student(testing_loader, args, student_model, sub_class, device):
@@ -397,7 +597,23 @@ def evaluate_student(testing_loader, args, student_model, sub_class, device):
                 args,
             )
 
-            out_mask = build_residual_anomaly_map(image, pred_x_0_condition, args)
+            seg_prob = None
+            if has_segmentation_head(student_model):
+                seg_logits = predict_segmentation_logits(student_model, pred_x_0_condition, image)
+                seg_prob = torch.sigmoid(seg_logits)
+
+            if get_arg_bool(args, "use_structure_branch", True):
+                structure_pred = predict_structure_map(student_model, pred_x_0_condition)
+            else:
+                structure_pred = torch.zeros_like(pred_x_0_condition[:, :1])
+
+            out_mask = build_fused_anomaly_map(
+                image,
+                pred_x_0_condition,
+                structure_pred,
+                args,
+                seg_prob=seg_prob,
+            )
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -436,27 +652,77 @@ def evaluate_student(testing_loader, args, student_model, sub_class, device):
 
 def save_checkpoint(teacher_model, student_model, args, final, epoch, sub_class, stage):
     save_path = f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}/params-{final}.pt'
-    torch.save(
-        {
-            "n_epoch": epoch,
-            "stage": stage,
-            "teacher_model_state_dict": unwrap_model(teacher_model).state_dict(),
-            "student_model_state_dict": unwrap_model(student_model).state_dict(),
-            "args": args,
-        },
-        save_path,
-    )
+    save_dir = os.path.dirname(save_path)
+    os.makedirs(save_dir, exist_ok=True)
+    tmp_path = save_path + ".tmp"
+
+    payload = {
+        "n_epoch": epoch,
+        "stage": stage,
+        "teacher_model_state_dict": unwrap_model(teacher_model).state_dict(),
+        "student_model_state_dict": unwrap_model(student_model).state_dict(),
+        "args": args,
+    }
+
+    try:
+        # Use temp path + atomic replace to avoid leaving truncated checkpoint files.
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, save_path)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+        err_text = str(e).lower()
+        disk_full_hint = (
+            "no space left" in err_text
+            or "pytorchstreamwriter failed writing file" in err_text
+            or "unexpected pos" in err_text
+            or "file write failed" in err_text
+        )
+        if disk_full_hint:
+            print(
+                f"[WARN] skip checkpoint save due to write failure (possible disk full): {save_path}\n"
+                f"       stage={stage}, class={sub_class}, epoch={epoch}, error={e}"
+            )
+            return
+        raise
+
+
+def load_state_compatible(model, state_dict, strict, rank, tag):
+    load_ret = model.load_state_dict(state_dict, strict=strict)
+    if is_main_process(rank):
+        missing = list(getattr(load_ret, "missing_keys", []))
+        unexpected = list(getattr(load_ret, "unexpected_keys", []))
+        if len(missing) > 0 or len(unexpected) > 0:
+            print(f"[{tag}] load_state_dict(strict={strict}) summary: missing={len(missing)}, unexpected={len(unexpected)}")
+            if len(missing) > 0:
+                print(f"[{tag}] missing keys (first 12): {missing[:12]}")
+            if len(unexpected) > 0:
+                print(f"[{tag}] unexpected keys (first 12): {unexpected[:12]}")
+    return load_ret
 
 
 def train_teacher_stage(training_loader, args, teacher_model, ddpm_sample, optimizer_teacher, device, rank=0, distributed=False):
     teacher_pretrain_epochs = max(1, get_arg_int(args, "teacher_pretrain_epochs", 200))
     teacher_recon_l1_w = get_arg_float(args, "teacher_recon_l1_w", 0.0)
+    teacher_structure_w = get_arg_float(args, "teacher_structure_w", 0.2)
+    use_segmentation_head = has_segmentation_head(teacher_model)
+    teacher_seg_supervise_w = get_arg_float(args, "teacher_seg_supervise_w", get_arg_float(args, "seg_supervise_w", 0.4))
+    seg_bce_w = get_arg_float(args, "seg_bce_w", 1.0)
+    seg_dice_w = get_arg_float(args, "seg_dice_w", 1.0)
     recon_loss = nn.SmoothL1Loss().to(device)
+    bce_logits = nn.BCEWithLogitsLoss().to(device)
 
     if is_main_process(rank):
         print(
             f"[teacher-stage] epochs={teacher_pretrain_epochs}, "
-            f"teacher_recon_l1_w={teacher_recon_l1_w}"
+            f"teacher_recon_l1_w={teacher_recon_l1_w}, "
+            f"teacher_structure_w={teacher_structure_w}, "
+            f"teacher_seg_supervise_w={teacher_seg_supervise_w}, "
+            f"use_segmentation_head={use_segmentation_head}"
         )
 
     for epoch in range(teacher_pretrain_epochs):
@@ -475,9 +741,12 @@ def train_teacher_stage(training_loader, args, teacher_model, ddpm_sample, optim
         for sample in tbar:
             aug_image = sample["augmented_image"].to(device)
             anomaly_label = sample["has_anomaly"].to(device).view(-1)
+            anomaly_mask = sample.get("anomaly_mask", None)
+            if anomaly_mask is not None:
+                anomaly_mask = anomaly_mask.to(device)
 
             normal_t, noisier_t, noise_normal, noise_noisier = sample_shared_diffusion_conditions(ddpm_sample, aug_image, args)
-            teacher_noise_loss, teacher_pred = norm_guided_forward_shared(
+            teacher_noise_loss, teacher_pred, _teacher_feat = norm_guided_forward_shared(
                 ddpm_sample,
                 teacher_model,
                 aug_image,
@@ -489,7 +758,29 @@ def train_teacher_stage(training_loader, args, teacher_model, ddpm_sample, optim
                 noise_noisier,
             )
 
-            loss = teacher_noise_loss + teacher_recon_l1_w * recon_loss(teacher_pred, aug_image)
+            structure_target = gradient_magnitude_map(aug_image)
+            teacher_structure_pred = predict_structure_map(teacher_model, teacher_pred)
+            structure_loss = recon_loss(teacher_structure_pred, structure_target)
+
+            teacher_seg_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+            if use_segmentation_head and has_segmentation_head(teacher_model):
+                teacher_seg_logits = predict_segmentation_logits(teacher_model, teacher_pred, aug_image)
+                if anomaly_mask is not None:
+                    seg_target = anomaly_mask.to(dtype=teacher_seg_logits.dtype)
+                    teacher_seg_loss = (
+                        seg_bce_w * bce_logits(teacher_seg_logits, seg_target)
+                        + seg_dice_w * dice_loss_from_logits(teacher_seg_logits, seg_target)
+                    )
+                else:
+                    # Keep the segmentation branch in the autograd graph under DDP even without mask labels.
+                    teacher_seg_loss = teacher_seg_logits.mean() * 0.0
+
+            loss = (
+                teacher_noise_loss
+                + teacher_recon_l1_w * recon_loss(teacher_pred, aug_image)
+                + teacher_structure_w * structure_loss
+                + teacher_seg_supervise_w * teacher_seg_loss
+            )
 
             optimizer_teacher.zero_grad()
             loss.backward()
@@ -523,9 +814,29 @@ def train_student_stage(
     student_noise_w = get_arg_float(args, "student_noise_w", 1.0)
     kd_recon_w = get_arg_float(args, "kd_recon_w", 1.0)
     kd_res_w = get_arg_float(args, "kd_res_w", 1.0)
+    kd_edge_w = get_arg_float(args, "kd_edge_w", 1.0)
+    feature_kd_w = get_arg_float(args, "feature_kd_w", 0.2)
+    anomaly_kd_w = get_arg_float(args, "anomaly_kd_w", 0.5)
     student_recon_w = get_arg_float(args, "student_recon_w", 0.2)
+    student_structure_w = get_arg_float(args, "student_structure_w", 0.5)
+    anomaly_ms_kd_w = get_arg_float(args, "anomaly_ms_kd_w", 0.2)
+    normal_suppress_w = get_arg_float(args, "normal_suppress_w", 0.3)
+    normal_mask_quantile = get_arg_float(args, "normal_mask_quantile", 0.7)
+    anomaly_kd_conf_tau = get_arg_float(args, "anomaly_kd_conf_tau", 0.4)
+    anomaly_kd_conf_gain = get_arg_float(args, "anomaly_kd_conf_gain", 0.5)
+    anomaly_ms_scales = [s for s in parse_int_list(args["anomaly_ms_scales"], [2, 4]) if s > 1]
+    use_segmentation_head = has_segmentation_head(student_model)
+    teacher_has_segmentation_head = has_segmentation_head(teacher_model)
+    seg_supervise_w = get_arg_float(args, "seg_supervise_w", 0.4)
+    seg_kd_w = get_arg_float(args, "seg_kd_w", 0.2)
+    seg_bce_w = get_arg_float(args, "seg_bce_w", 1.0)
+    seg_dice_w = get_arg_float(args, "seg_dice_w", 1.0)
+    hard_negative_w = get_arg_float(args, "hard_negative_w", 0.4)
+    hard_negative_ratio = get_arg_float(args, "hard_negative_ratio", 0.15)
+    hard_negative_teacher_q = get_arg_float(args, "hard_negative_teacher_q", 0.85)
 
     smooth_l1 = nn.SmoothL1Loss().to(device)
+    bce_logits = nn.BCEWithLogitsLoss().to(device)
 
     best_image_auroc = 0.0
     best_pixel_auroc = 0.0
@@ -551,8 +862,20 @@ def train_student_stage(
     if is_main_process(rank):
         print(
             f"[student-stage] epochs={student_epochs}, eval_interval={eval_interval}, "
-            f"weights(noise/kd_recon/kd_res/student_recon)="
-            f"{student_noise_w}/{kd_recon_w}/{kd_res_w}/{student_recon_w}"
+            f"weights(noise/kd_recon/kd_res/kd_edge/feat_kd/anom_kd/anom_ms/normal_suppr/student_recon/student_struct)="
+            f"{student_noise_w}/{kd_recon_w}/{kd_res_w}/{kd_edge_w}/{feature_kd_w}/"
+            f"{anomaly_kd_w}/{anomaly_ms_kd_w}/{normal_suppress_w}/{student_recon_w}/{student_structure_w}"
+        )
+        print(
+            f"[student-stage] normal_mask_quantile={normal_mask_quantile}, "
+            f"anomaly_kd_conf_tau={anomaly_kd_conf_tau}, anomaly_kd_conf_gain={anomaly_kd_conf_gain}, "
+            f"anomaly_ms_scales={anomaly_ms_scales}"
+        )
+        print(
+            f"[student-stage] seg_head={use_segmentation_head}, "
+            f"seg_supervise_w={seg_supervise_w}, seg_kd_w={seg_kd_w}, seg_bce_w={seg_bce_w}, seg_dice_w={seg_dice_w}, "
+            f"hard_negative_w={hard_negative_w}, hard_negative_ratio={hard_negative_ratio}, "
+            f"hard_negative_teacher_q={hard_negative_teacher_q}"
         )
 
     for p in teacher_model.parameters():
@@ -576,11 +899,15 @@ def train_student_stage(
         for sample in tbar:
             aug_image = sample["augmented_image"].to(device)
             anomaly_label = sample["has_anomaly"].to(device).view(-1)
+            anomaly_mask = sample.get("anomaly_mask", None)
+            if anomaly_mask is not None:
+                anomaly_mask = anomaly_mask.to(device)
 
             normal_t, noisier_t, noise_normal, noise_noisier = sample_shared_diffusion_conditions(ddpm_sample, aug_image, args)
+            structure_target = gradient_magnitude_map(aug_image)
 
             with torch.no_grad():
-                _teacher_noise_loss, teacher_pred = norm_guided_forward_shared(
+                _teacher_noise_loss, teacher_pred, teacher_feat = norm_guided_forward_shared(
                     ddpm_sample,
                     teacher_model,
                     aug_image,
@@ -591,8 +918,20 @@ def train_student_stage(
                     noise_normal,
                     noise_noisier,
                 )
+                teacher_structure_pred = predict_structure_map(teacher_model, teacher_pred)
+                teacher_seg_prob = None
+                if teacher_has_segmentation_head:
+                    teacher_seg_logits = predict_segmentation_logits(teacher_model, teacher_pred, aug_image)
+                    teacher_seg_prob = torch.sigmoid(teacher_seg_logits)
+                teacher_anomaly_map = build_fused_anomaly_map(
+                    aug_image,
+                    teacher_pred,
+                    teacher_structure_pred,
+                    args,
+                    seg_prob=teacher_seg_prob,
+                )
 
-            student_noise_loss, student_pred = norm_guided_forward_shared(
+            student_noise_loss, student_pred, student_feat = norm_guided_forward_shared(
                 ddpm_sample,
                 student_model,
                 aug_image,
@@ -603,16 +942,120 @@ def train_student_stage(
                 noise_normal,
                 noise_noisier,
             )
+            student_structure_pred = predict_structure_map(student_model, student_pred)
+            student_seg_logits = None
+            student_seg_prob = None
+            if use_segmentation_head:
+                student_seg_logits = predict_segmentation_logits(student_model, student_pred, aug_image)
+                student_seg_prob = torch.sigmoid(student_seg_logits)
+
+            student_anomaly_map = build_fused_anomaly_map(
+                aug_image,
+                student_pred,
+                student_structure_pred,
+                args,
+                seg_prob=student_seg_prob,
+            )
 
             kd_recon_loss = smooth_l1(student_pred, teacher_pred)
             kd_res_loss = smooth_l1(torch.abs(aug_image - student_pred), torch.abs(aug_image - teacher_pred))
+            kd_edge_loss = smooth_l1(student_structure_pred, teacher_structure_pred)
             student_recon_loss = smooth_l1(student_pred, aug_image)
+            student_structure_loss = smooth_l1(student_structure_pred, structure_target)
+
+            if teacher_feat is not None and student_feat is not None:
+                feature_kd_loss = smooth_l1(student_feat, teacher_feat)
+            else:
+                feature_kd_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+
+            normal_region_mask, anomaly_kd_weight_map = build_teacher_guided_maps(
+                teacher_anomaly_map,
+                anomaly_label,
+                normal_mask_quantile,
+                anomaly_kd_conf_tau,
+                anomaly_kd_conf_gain,
+            )
+
+            anomaly_kd_loss = weighted_smooth_l1(
+                student_anomaly_map,
+                teacher_anomaly_map,
+                anomaly_kd_weight_map,
+            )
+
+            normal_suppress_loss = weighted_smooth_l1(
+                student_anomaly_map,
+                torch.zeros_like(student_anomaly_map),
+                normal_region_mask,
+            )
+
+            anomaly_ms_kd_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+            if anomaly_ms_kd_w > 0 and len(anomaly_ms_scales) > 0:
+                ms_losses = []
+                spatial_min = min(student_anomaly_map.shape[-2], student_anomaly_map.shape[-1])
+                for scale in anomaly_ms_scales:
+                    if spatial_min < scale:
+                        continue
+
+                    student_map_ms = F.avg_pool2d(student_anomaly_map, kernel_size=scale, stride=scale)
+                    teacher_map_ms = F.avg_pool2d(teacher_anomaly_map, kernel_size=scale, stride=scale)
+                    weight_map_ms = F.avg_pool2d(anomaly_kd_weight_map, kernel_size=scale, stride=scale)
+                    ms_losses.append(weighted_smooth_l1(student_map_ms, teacher_map_ms, weight_map_ms))
+
+                if len(ms_losses) > 0:
+                    anomaly_ms_kd_loss = torch.stack(ms_losses).mean()
+
+            hard_negative_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+            if hard_negative_w > 0:
+                teacher_norm = tensor_minmax_norm(teacher_anomaly_map.detach())
+                student_norm = tensor_minmax_norm(student_anomaly_map)
+
+                teacher_high_th = per_sample_quantile(teacher_norm, hard_negative_teacher_q)
+                teacher_low_mask = (teacher_norm <= teacher_high_th).to(student_norm.dtype)
+                normal_sample_mask = (anomaly_label == 0).to(student_norm.dtype).view(-1, 1, 1, 1)
+                candidate_mask = teacher_low_mask * normal_sample_mask
+                hard_mask = build_topk_mask(student_norm, candidate_mask, hard_negative_ratio)
+
+                if hard_mask.sum() > 0:
+                    hard_negative_loss = weighted_smooth_l1(
+                        student_norm,
+                        torch.zeros_like(student_norm),
+                        hard_mask,
+                    )
+
+            seg_supervise_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+            seg_kd_loss = torch.zeros((), dtype=aug_image.dtype, device=aug_image.device)
+            if (
+                use_segmentation_head
+                and student_seg_logits is not None
+                and anomaly_mask is not None
+            ):
+                seg_target = anomaly_mask.to(dtype=student_seg_logits.dtype)
+                seg_supervise_loss = (
+                    seg_bce_w * bce_logits(student_seg_logits, seg_target)
+                    + seg_dice_w * dice_loss_from_logits(student_seg_logits, seg_target)
+                )
+
+                if teacher_seg_prob is not None:
+                    seg_kd_loss = weighted_smooth_l1(
+                        torch.sigmoid(student_seg_logits),
+                        teacher_seg_prob.detach(),
+                        anomaly_kd_weight_map,
+                    )
 
             loss = (
                 student_noise_w * student_noise_loss
                 + kd_recon_w * kd_recon_loss
                 + kd_res_w * kd_res_loss
+                + kd_edge_w * kd_edge_loss
+                + feature_kd_w * feature_kd_loss
+                + anomaly_kd_w * anomaly_kd_loss
+                + anomaly_ms_kd_w * anomaly_ms_kd_loss
+                + normal_suppress_w * normal_suppress_loss
+                + hard_negative_w * hard_negative_loss
                 + student_recon_w * student_recon_loss
+                + student_structure_w * student_structure_loss
+                + seg_supervise_w * seg_supervise_loss
+                + seg_kd_w * seg_kd_loss
             )
 
             optimizer_student.zero_grad()
@@ -780,32 +1223,57 @@ def train_one_class(
 
     teacher_base_channels = get_arg_int(args, "teacher_base_channels", get_arg_int(args, "base_channels", 128))
     student_base_channels = get_arg_int(args, "student_base_channels", max(32, teacher_base_channels // 2))
+    teacher_structure_hidden = get_arg_int(args, "teacher_structure_hidden_channels", 32)
+    student_structure_hidden = get_arg_int(args, "student_structure_hidden_channels", 32)
+    teacher_feature_kd_channels = get_arg_int(args, "teacher_feature_kd_channels", 64)
+    student_feature_kd_channels = get_arg_int(args, "student_feature_kd_channels", 64)
+    use_segmentation_head = get_arg_bool(args, "use_segmentation_head", True)
+    teacher_use_segmentation_head = get_arg_bool(args, "teacher_use_segmentation_head", False)
+    student_use_segmentation_head = get_arg_bool(args, "student_use_segmentation_head", use_segmentation_head)
+    seg_input_mode = args["seg_input_mode"] if args["seg_input_mode"] else "concat"
+    teacher_seg_hidden_channels = get_arg_int(args, "teacher_seg_hidden_channels", 24)
+    student_seg_hidden_channels = get_arg_int(args, "student_seg_hidden_channels", 24)
+    teacher_seg_init_temperature = get_arg_float(args, "teacher_seg_init_temperature", 1.0)
+    student_seg_init_temperature = get_arg_float(args, "student_seg_init_temperature", 1.0)
 
     teacher_channel_mults = parse_channel_mults(args["teacher_channel_mults"], args["channel_mults"])
     student_channel_mults = parse_channel_mults(args["student_channel_mults"], args["channel_mults"])
 
-    teacher_model = UNetModel(
-        args["img_size"][0],
-        teacher_base_channels,
+    teacher_model = ReconDualBranchModel(
+        img_size=args["img_size"][0],
+        base_channels=teacher_base_channels,
         channel_mults=teacher_channel_mults,
         dropout=args["dropout"],
         n_heads=args["num_heads"],
         n_head_channels=args["num_head_channels"],
         in_channels=in_channels,
+        structure_hidden_channels=teacher_structure_hidden,
+        feature_kd_channels=teacher_feature_kd_channels,
+        use_segmentation_head=teacher_use_segmentation_head,
+        seg_input_mode=seg_input_mode,
+        seg_hidden_channels=teacher_seg_hidden_channels,
+        seg_init_temperature=teacher_seg_init_temperature,
     ).to(device)
 
-    student_model = UNetModel(
-        args["img_size"][0],
-        student_base_channels,
+    student_model = ReconDualBranchModel(
+        img_size=args["img_size"][0],
+        base_channels=student_base_channels,
         channel_mults=student_channel_mults,
         dropout=args["dropout"],
         n_heads=args["num_heads"],
         n_head_channels=args["num_head_channels"],
         in_channels=in_channels,
+        structure_hidden_channels=student_structure_hidden,
+        feature_kd_channels=student_feature_kd_channels,
+        use_segmentation_head=student_use_segmentation_head,
+        seg_input_mode=seg_input_mode,
+        seg_hidden_channels=student_seg_hidden_channels,
+        seg_init_temperature=student_seg_init_temperature,
     ).to(device)
 
     if distributed:
         ddp_find_unused = get_arg_bool(args, "ddp_find_unused_parameters", False)
+
         if device.type == "cuda":
             ddp_kwargs = {
                 "device_ids": [device.index],
@@ -841,14 +1309,53 @@ def train_one_class(
             f"[{sub_class}] distributed={distributed}, world_size={world_size}, "
             f"batch_per_gpu={args['Batch_Size']}, global_batch={global_batch_size}, lr_scale={lr_scale:.2f}"
         )
+        if distributed:
+            print(f"[{sub_class}] DDP find_unused_parameters={ddp_find_unused}")
         print(
             f"[{sub_class}] teacher(base={teacher_base_channels}, mults={teacher_channel_mults}) | "
             f"student(base={student_base_channels}, mults={student_channel_mults})"
+        )
+        print(
+            f"[{sub_class}] struct_head teacher/student={teacher_structure_hidden}/{student_structure_hidden}, "
+            f"feature_kd_ch teacher/student={teacher_feature_kd_channels}/{student_feature_kd_channels}"
+        )
+        print(
+            f"[{sub_class}] seg_head teacher/student={teacher_use_segmentation_head}/{student_use_segmentation_head}, "
+            f"seg_input_mode={seg_input_mode}, "
+            f"seg_hidden teacher/student={teacher_seg_hidden_channels}/{student_seg_hidden_channels}"
         )
         print(f"[{sub_class}] lr: teacher={teacher_lr:.2e}, student={student_lr:.2e}")
 
     optimizer_teacher = optim.Adam(teacher_model.parameters(), lr=teacher_lr, weight_decay=args["weight_decay"])
     optimizer_student = optim.Adam(student_model.parameters(), lr=student_lr, weight_decay=args["weight_decay"])
+
+    warm_start_latest = get_arg_bool(args, "warm_start_latest", False)
+    if warm_start_latest:
+        ckpt_dir = f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/{sub_class}'
+        student_last_path = os.path.join(ckpt_dir, "params-last.pt")
+        teacher_last_path = os.path.join(ckpt_dir, "params-teacher-last.pt")
+
+        loaded_any = False
+        if os.path.exists(student_last_path):
+            ckpt = torch.load(student_last_path, map_location=device)
+            teacher_state = ckpt.get("teacher_model_state_dict", None)
+            student_state = ckpt.get("student_model_state_dict", None)
+            if teacher_state is not None:
+                load_state_compatible(unwrap_model(teacher_model), teacher_state, strict=False, rank=rank, tag=f"{sub_class}/teacher_from_last")
+                loaded_any = True
+            if student_state is not None:
+                load_state_compatible(unwrap_model(student_model), student_state, strict=False, rank=rank, tag=f"{sub_class}/student_from_last")
+                loaded_any = True
+
+        if (not loaded_any) and os.path.exists(teacher_last_path):
+            ckpt = torch.load(teacher_last_path, map_location=device)
+            teacher_state = ckpt.get("teacher_model_state_dict", None)
+            if teacher_state is not None:
+                load_state_compatible(unwrap_model(teacher_model), teacher_state, strict=False, rank=rank, tag=f"{sub_class}/teacher_from_teacher_last")
+                loaded_any = True
+
+        if is_main_process(rank):
+            print(f"[{sub_class}] warm_start_latest={warm_start_latest}, loaded_any={loaded_any}")
 
     train_teacher_stage(
         training_loader,
@@ -904,6 +1411,9 @@ def main():
     args["arg_num"] = args.get("arg_num", os.path.splitext(os.path.basename(config_path))[0])
     args = defaultdict_from_json(args)
 
+    run_seed = get_arg_int(args, "seed", 42)
+    set_global_seed(run_seed)
+
     distributed, rank, local_rank, world_size = setup_distributed(args)
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
@@ -923,6 +1433,7 @@ def main():
     if is_main_process(rank):
         print("Using config:", config_path)
         print("Selected classes:", current_classes)
+        print("Seed:", run_seed)
         print("Train mode: teacher pretrain -> student distill")
         print("Test mode: residual map only, mode:", args["test_anomaly_map_mode"])
         print(f"DDP enabled: {distributed}, world_size={world_size}, rank={rank}, local_rank={local_rank}")
@@ -997,5 +1508,4 @@ def main():
 
 
 if __name__ == "__main__":
-    seed(42)
     main()

@@ -1,8 +1,8 @@
-from random import seed
 import argparse
 import csv
 import os
 import json
+import random
 import shutil
 import time
 import tempfile
@@ -226,6 +226,27 @@ def get_arg_float(args, key, default):
     if value == "" or value is None:
         return default
     return float(value)
+
+
+def set_global_seed(seed_value: int, deterministic: bool = True):
+    os.environ["PYTHONHASHSEED"] = str(seed_value)
+
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def build_monitor_score(metrics, args):
@@ -710,6 +731,10 @@ def main():
     args = defaultdict_from_json(args)
     configure_runtime_environment(args)
 
+    run_seed = get_arg_int(args, "seed", 42)
+    deterministic = bool(get_arg_int(args, "deterministic", 1))
+    set_global_seed(run_seed, deterministic=deterministic)
+
     if args["recon_mamba_mode"] != "none":
         if not MAMBA_AVAILABLE:
             raise RuntimeError(
@@ -733,6 +758,11 @@ def main():
     print("Using config:", config_path)
     print("Selected classes:", current_classes)
     print("Mamba mode:", args["recon_mamba_mode"])
+    print("Seed:", run_seed)
+    print("Deterministic:", deterministic)
+
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(run_seed)
 
     for sub_class in current_classes:
         print("Training class:", sub_class)
@@ -746,6 +776,8 @@ def main():
             pin_memory=True,
             drop_last=True,
             persistent_workers=args["num_workers_train"] > 0,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
         )
         test_loader = DataLoader(
             testing_dataset,
@@ -753,6 +785,8 @@ def main():
             shuffle=False,
             num_workers=args["num_workers_test"],
             persistent_workers=args["num_workers_test"] > 0,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
         )
 
         for folder in [
@@ -766,5 +800,4 @@ def main():
 
 
 if __name__ == "__main__":
-    seed(42)
     main()

@@ -36,6 +36,7 @@ from data.dataset_beta_thresh import (
 )
 from models.DDPM import GaussianDiffusionModel, get_beta_schedule
 from models.Recon_subnetwork import UNetModel
+from models.Recon_dualbranch import ReconDualBranchModel
 
 
 def resolve_config_path(config_arg: str) -> str:
@@ -171,16 +172,6 @@ def load_student_model(args, sub_class, checkpoint_type, device):
     student_base_channels = get_arg_int(args, "student_base_channels", get_arg_int(args, "base_channels", 128))
     student_channel_mults = parse_channel_mults(args["student_channel_mults"], args["channel_mults"])
 
-    model = UNetModel(
-        args["img_size"][0],
-        student_base_channels,
-        channel_mults=student_channel_mults,
-        dropout=args["dropout"],
-        n_heads=args["num_heads"],
-        n_head_channels=args["num_head_channels"],
-        in_channels=in_channels,
-    ).to(device)
-
     ckpt_path = (
         f'{args["output_path"]}/model/diff-params-ARGS={args["arg_num"]}/'
         f'{sub_class}/params-{checkpoint_type}.pt'
@@ -196,7 +187,35 @@ def load_student_model(args, sub_class, checkpoint_type, device):
     else:
         raise KeyError(f"No student/unet state dict found in {ckpt_path}")
 
-    model.load_state_dict(state, strict=True)
+    if any(k.startswith("backbone.") for k in state.keys()):
+        use_segmentation_head = any(k.startswith("seg_head.") or k.startswith("seg_temperature_raw") for k in state.keys())
+        model = ReconDualBranchModel(
+            img_size=args["img_size"][0],
+            base_channels=student_base_channels,
+            channel_mults=student_channel_mults,
+            dropout=args["dropout"],
+            n_heads=args["num_heads"],
+            n_head_channels=args["num_head_channels"],
+            in_channels=in_channels,
+            structure_hidden_channels=get_arg_int(args, "student_structure_hidden_channels", 32),
+            feature_kd_channels=get_arg_int(args, "student_feature_kd_channels", 64),
+            use_segmentation_head=use_segmentation_head,
+            seg_input_mode=args.get("seg_input_mode", "concat") if hasattr(args, "get") else "concat",
+            seg_hidden_channels=get_arg_int(args, "student_seg_hidden_channels", 24),
+            seg_init_temperature=1.0,
+        ).to(device)
+    else:
+        model = UNetModel(
+            args["img_size"][0],
+            student_base_channels,
+            channel_mults=student_channel_mults,
+            dropout=args["dropout"],
+            n_heads=args["num_heads"],
+            n_head_channels=args["num_head_channels"],
+            in_channels=in_channels,
+        ).to(device)
+
+    model.load_state_dict(state, strict=False)
     model.eval()
     return model, ckpt_path
 

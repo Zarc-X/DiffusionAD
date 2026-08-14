@@ -1,14 +1,14 @@
 {
-    "arg_num": "recon_teacher_student_smoke",
+    "arg_num": "recon_teacher_student_20260727",
     "img_size": [
         256,
         256
     ],
     "Batch_Size": 4,
-    "EPOCHS": 2,
-    "teacher_pretrain_epochs": 1,
-    "student_epochs": 2,
-    "eval_interval": 1,
+    "EPOCHS": 1200,
+    "teacher_pretrain_epochs": 300,
+    "student_epochs": 1200,
+    "eval_interval": 10,
     "T": 1000,
     "base_channels": 128,
     "teacher_base_channels": 128,
@@ -123,9 +123,13 @@
     "ddp_find_unused_parameters": false,
     "lr_scale_with_world_size": true,
     "lr_scale_base_world_size": 4,
-    "output_path": "outputs_recon_teacher_student_smoke",
+    "output_path": "outputs_recon_teacher_student_20260727",
     "test_anomaly_map_mode": "residual_mean",
     "selected_classes": [
-        "carpet"
+        "carpet",
+        "cable",
+        "capsule",
+        "screw",
+        "transistor"
     ]
 }
