@@ -1,13 +1,13 @@
 {
-    "arg_num": "mamba_medium",
+    "arg_num": "mamba_medium_probe_2cls",
     "img_size": [
         256,
         256
     ],
     "Batch_Size": 4,
-    "EPOCHS": 300,
+    "EPOCHS": 600,
     "eval_interval": 5,
-    "early_stop_patience": 30,
+    "early_stop_patience": 0,
     "early_stop_min_delta": 0.0,
     "early_stop_warmup_evals": 8,
     "early_stop_w_image_auroc": 0.0,
@@ -30,8 +30,8 @@
     "loss_type": "l2",
     "loss-type": "l2",
     "loss_weight": "none",
-    "diffusion_lr": 0.0001,
-    "seg_lr": 0.00001,
+    "diffusion_lr": 0.00005,
+    "seg_lr": 0.000005,
     "weight_decay": 0.0,
     "dropout": 0,
     "attention_resolutions": "32,16,8",
@@ -49,7 +49,7 @@
     "condition_w": 1,
     "eval_normal_t": 200,
     "eval_noisier_t": 400,
-    "output_path": "outputs_mamba_recon",
+    "output_path": "outputs_mamba_recon_medium_probe",
     "num_workers_train": 4,
     "num_workers_test": 2,
     "mp_tmp_root": "",
@@ -65,10 +65,7 @@
     "mamba_bidirectional": 1,
     "mamba_medium_min_ds": 8,
     "selected_classes": [
-        "carpet",
         "cable",
-        "capsule",
-        "screw",
         "transistor"
     ]
 }
