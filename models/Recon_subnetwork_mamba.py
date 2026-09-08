@@ -108,6 +108,10 @@ class UNetModelMamba(nn.Module):
         - "none": keep original attention-only UNet behavior.
         - "low": replace attention blocks at selected resolutions with Mamba.
         - "medium": low-risk replacement + additional deep-stage Mamba blocks.
+
+    medium-specific knobs:
+        - mamba_medium_extra_middle: whether to append an extra middle Mamba block.
+        - mamba_medium_broad_coverage: whether medium uses broad stage coverage via min-ds gate.
     """
 
     def __init__(
@@ -131,6 +135,8 @@ class UNetModelMamba(nn.Module):
         mamba_dropout=0.0,
         mamba_bidirectional=True,
         mamba_medium_min_ds=8,
+        mamba_medium_extra_middle=True,
+        mamba_medium_broad_coverage=True,
     ):
         super().__init__()
         self.dtype = torch.float32
@@ -176,6 +182,8 @@ class UNetModelMamba(nn.Module):
         self.mamba_dropout = mamba_dropout
         self.mamba_bidirectional = mamba_bidirectional
         self.mamba_medium_min_ds = mamba_medium_min_ds
+        self.mamba_medium_extra_middle = bool(mamba_medium_extra_middle)
+        self.mamba_medium_broad_coverage = bool(mamba_medium_broad_coverage)
 
         time_embed_dim = base_channels * 4
         self.time_embedding = nn.Sequential(
@@ -246,7 +254,7 @@ class UNetModelMamba(nn.Module):
                 dropout=dropout,
             )
         )
-        if self.mamba_mode == "medium":
+        if self.mamba_mode == "medium" and self.mamba_medium_extra_middle:
             middle_layers.append(
                 SpatialMambaBlock(
                     ch,
@@ -304,7 +312,10 @@ class UNetModelMamba(nn.Module):
         if self.mamba_mode == "low":
             use_mamba = ds in self.mamba_ds
         elif self.mamba_mode == "medium":
-            use_mamba = (ds in self.mamba_ds) or (ds >= self.mamba_medium_min_ds)
+            if self.mamba_medium_broad_coverage:
+                use_mamba = (ds in self.mamba_ds) or (ds >= self.mamba_medium_min_ds)
+            else:
+                use_mamba = ds in self.mamba_ds
 
         if use_mamba:
             return SpatialMambaBlock(

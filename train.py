@@ -508,6 +508,11 @@ def main():
         default="args1.json",
         help="Config filename under args/ or absolute path",
     )
+    parser.add_argument(
+        "--class-set",
+        default="",
+        help="Comma separated class list. Overrides config key selected_classes when provided",
+    )
     cli_args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -531,7 +536,11 @@ def main():
     configure_runtime_environment(args)
 
 
-    mvtec_classes = ['carpet', 'cable', 'capsule', 'screw', 'transistor']
+    mvtec_classes = [
+        'carpet', 'grid', 'leather', 'tile', 'wood',
+        'bottle', 'cable', 'capsule', 'hazelnut', 'metal_nut',
+        'pill', 'screw', 'toothbrush', 'transistor', 'zipper'
+    ]
     
     visa_classes = ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1', 'macaroni2', 'pcb1', 'pcb2',
              'pcb3', 'pcb4', 'pipe_fryum']
@@ -539,8 +548,16 @@ def main():
     mpdd_classes = ['bracket_black', 'bracket_brown', 'bracket_white', 'connector', 'metal_plate', 'tubes'] 
     dagm_class = ['Class1', 'Class2', 'Class3', 'Class4', 'Class5','Class6', 'Class7', 'Class8', 'Class9', 'Class10']
 
+    if cli_args.class_set.strip():
+        current_classes = [x.strip() for x in cli_args.class_set.split(',') if x.strip()]
+    else:
+        selected_classes = args.get('selected_classes', [])
+        if isinstance(selected_classes, list) and len(selected_classes) > 0:
+            current_classes = list(selected_classes)
+        else:
+            current_classes = mvtec_classes
 
-    current_classes = mvtec_classes
+    print("Selected classes:", current_classes)
 
     class_type = ''
     for sub_class in current_classes:    

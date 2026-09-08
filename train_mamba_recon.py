@@ -228,6 +228,17 @@ def get_arg_float(args, key, default):
     return float(value)
 
 
+def get_arg_bool(args, key, default):
+    value = args[key]
+    if value == "" or value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def set_global_seed(seed_value: int, deterministic: bool = True):
     os.environ["PYTHONHASHSEED"] = str(seed_value)
 
@@ -426,6 +437,8 @@ def train_one_class(training_loader, testing_loader, args, sub_class, class_type
         mamba_dropout=args["mamba_dropout"],
         mamba_bidirectional=bool(args["mamba_bidirectional"]),
         mamba_medium_min_ds=args["mamba_medium_min_ds"],
+        mamba_medium_extra_middle=get_arg_bool(args, "mamba_medium_extra_middle", True),
+        mamba_medium_broad_coverage=get_arg_bool(args, "mamba_medium_broad_coverage", True),
     ).to(device)
 
     betas = get_beta_schedule(args["T"], args["beta_schedule"])
