@@ -344,13 +344,63 @@ class GaussianDiffusionModel:
             loss["loss"] = mean_flat((estimate_noise - noise).square())
         return loss, x_t, estimate_noise
 
+    @staticmethod
+    def _get_arg_value(args, key, default):
+        if hasattr(args, "get"):
+            value = args.get(key, default)
+        else:
+            try:
+                value = args[key]
+            except Exception:
+                value = default
+        if value == "" or value is None:
+            return default
+        return value
+
+    @classmethod
+    def _get_arg_bool(cls, args, key, default=False):
+        value = cls._get_arg_value(args, key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @classmethod
+    def _get_arg_float(cls, args, key, default=0.0):
+        value = cls._get_arg_value(args, key, default)
+        return float(value)
+
    
     def norm_guided_one_step_denoising(self, model, x_0, anomaly_label,args):
         # two-scale t
         normal_t = torch.randint(0, args["less_t_range"], (x_0.shape[0],),device=x_0.device)
-        noisier_t = torch.randint(args["less_t_range"],self.num_timesteps,(x_0.shape[0],),device=x_0.device)
-        
         normal_loss, x_normal_t, estimate_noise_normal = self.calc_loss(model, x_0, normal_t)
+
+        if self._get_arg_bool(args, "diffusion_single_path", False):
+            loss_scale = self._get_arg_float(args, "single_path_loss_scale", 2.0)
+            condition_scale = self._get_arg_float(args, "single_path_condition_w_scale", 1.0)
+
+            pred_x_0_normal = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_normal).clamp(-1, 1)
+            pred_x_t_proxy = self.sample_q(pred_x_0_normal, normal_t, estimate_noise_normal)
+
+            estimate_noise_hat = estimate_noise_normal - extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                normal_t,
+                x_normal_t.shape,
+                x_0.device,
+            ) * args["condition_w"] * condition_scale * (pred_x_t_proxy - x_normal_t)
+
+            pred_x_0_norm_guided = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
+
+            # Approximate the two-path training loss with scaled single-path noise loss.
+            loss = (normal_loss["loss"] * loss_scale)[anomaly_label == 0].mean()
+            if torch.isnan(loss):
+                loss.fill_(0.0)
+
+            return loss, pred_x_0_norm_guided, normal_t, x_normal_t, pred_x_t_proxy
+
+        noisier_t = torch.randint(args["less_t_range"],self.num_timesteps,(x_0.shape[0],),device=x_0.device)
         noisier_loss, x_noiser_t, estimate_noise_noisier = self.calc_loss(model, x_0, noisier_t)
         
         pred_x_0_noisier = self.predict_x_0_from_eps(x_noiser_t, noisier_t, estimate_noise_noisier).clamp(-1, 1)
@@ -373,6 +423,33 @@ class GaussianDiffusionModel:
 
         
         normal_loss, x_normal_t, estimate_noise_normal = self.calc_loss(model, x_0, normal_t)
+
+        if self._get_arg_bool(args, "diffusion_single_path", False):
+            loss_scale = self._get_arg_float(args, "single_path_loss_scale", 2.0)
+            condition_scale = self._get_arg_float(args, "single_path_condition_w_scale", 1.0)
+
+            loss = (normal_loss["loss"] * loss_scale).mean()
+            pred_x_0_normal = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_normal).clamp(-1, 1)
+            pred_x_t_proxy = self.sample_q(pred_x_0_normal, normal_t, estimate_noise_normal)
+
+            estimate_noise_hat = estimate_noise_normal - extract(
+                self.sqrt_one_minus_alphas_cumprod,
+                normal_t,
+                x_0.shape,
+                x_0.device,
+            ) * args["condition_w"] * condition_scale * (pred_x_t_proxy - x_normal_t)
+            pred_x_0_norm_guided = self.predict_x_0_from_eps(x_normal_t, normal_t, estimate_noise_hat).clamp(-1, 1)
+
+            return (
+                loss,
+                pred_x_0_norm_guided,
+                pred_x_0_normal,
+                pred_x_0_normal,
+                x_normal_t,
+                pred_x_t_proxy,
+                pred_x_t_proxy,
+            )
+
         noisier_loss, x_noisier_t, estimate_noise_noisier = self.calc_loss(model, x_0, noisier_t)
 
         pred_x_0_noisier = self.predict_x_0_from_eps(x_noisier_t, noisier_t, estimate_noise_noisier).clamp(-1, 1)
