@@ -773,6 +773,75 @@ def main():
     print("Mamba mode:", args["recon_mamba_mode"])
     print("Seed:", run_seed)
     print("Deterministic:", deterministic)
+    if get_arg_bool(args, "diffusion_single_path", False):
+        print("Single-path proxy mode:", args.get("single_path_proxy_mode", "self"))
+        print(
+            "Single-path scales:",
+            {
+                "loss": get_arg_float(args, "single_path_loss_scale", 2.0),
+                "condition": get_arg_float(args, "single_path_condition_w_scale", 1.0),
+                "residual": get_arg_float(args, "single_path_residual_scale", 1.0),
+            },
+        )
+        if get_arg_bool(args, "guidance_timestep_schedule_enable", False):
+            print(
+                "Guidance timestep schedule:",
+                {
+                    "t1": get_arg_int(args, "guidance_timestep_schedule_t1", 100),
+                    "t2": get_arg_int(args, "guidance_timestep_schedule_t2", 220),
+                    "w_early": get_arg_float(args, "guidance_timestep_schedule_w_early", 0.9),
+                    "w_mid": get_arg_float(args, "guidance_timestep_schedule_w_mid", 1.1),
+                    "w_late": get_arg_float(args, "guidance_timestep_schedule_w_late", 0.9),
+                    "detach_weight": get_arg_bool(args, "guidance_timestep_schedule_detach_weight", True),
+                },
+            )
+        if get_arg_bool(args, "single_path_consistency_enable", False):
+            print(
+                "Single-path consistency guidance:",
+                {
+                    "proxy_mode": str(args.get("single_path_consistency_proxy_mode", "pseudo_noisier")),
+                    "delta_t": get_arg_int(args, "single_path_consistency_delta_t", 160),
+                    "proxy_mix": get_arg_float(args, "single_path_consistency_proxy_mix", 1.0),
+                    "detach_high": get_arg_bool(args, "single_path_consistency_detach_high", True),
+                    "residual_scale": get_arg_float(args, "single_path_consistency_residual_scale", 1.0),
+                    "normalize": get_arg_bool(args, "single_path_consistency_normalize", True),
+                    "tau": get_arg_float(args, "single_path_consistency_tau", 0.5),
+                    "beta": get_arg_float(args, "single_path_consistency_beta", 8.0),
+                    "weight_range": [
+                        get_arg_float(args, "single_path_consistency_min_weight", 0.5),
+                        get_arg_float(args, "single_path_consistency_max_weight", 1.5),
+                    ],
+                    "detach_weight": get_arg_bool(args, "single_path_consistency_detach_weight", True),
+                },
+            )
+        if get_arg_bool(args, "single_path_irf_weight_enable", False):
+            print(
+                "Single-path IRF guidance:",
+                {
+                    "score_mode": str(args.get("single_path_irf_score_mode", "l2")),
+                    "adaptive_tau": get_arg_bool(args, "single_path_irf_adaptive_tau", False),
+                    "tau": get_arg_float(args, "single_path_irf_tau", 1.0),
+                    "tau_std_scale": get_arg_float(args, "single_path_irf_tau_std_scale", 1.0),
+                    "sigmoid_beta": get_arg_float(args, "single_path_irf_sigmoid_beta", 4.0),
+                    "weight_range": [
+                        get_arg_float(args, "single_path_irf_min_weight", 0.5),
+                        get_arg_float(args, "single_path_irf_max_weight", 1.5),
+                    ],
+                    "clip": get_arg_float(args, "single_path_irf_clip", 0.0),
+                },
+            )
+        if get_arg_bool(args, "single_path_residual_distill", False):
+            print(
+                "Single-path residual distill:",
+                {
+                    "weight": get_arg_float(args, "single_path_distill_weight", 0.0),
+                    "prob": get_arg_float(args, "single_path_distill_prob", 1.0),
+                    "use_delta_t": get_arg_bool(args, "single_path_distill_use_delta_t", False),
+                    "delta_t": get_arg_int(args, "single_path_distill_delta_t", 200),
+                    "min_t": get_arg_int(args, "single_path_distill_min_t", get_arg_int(args, "less_t_range", 300)),
+                    "normalize": get_arg_bool(args, "single_path_distill_normalize", True),
+                },
+            )
 
     loader_generator = torch.Generator()
     loader_generator.manual_seed(run_seed)
