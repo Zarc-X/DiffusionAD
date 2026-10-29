@@ -1,0 +1,2 @@
+python train_mamba_recon.py --config args_mamba_low_unidir_singlepath_tschedule_tune_objA.json
+python train_mamba_recon.py --config args_mamba_low_unidir_singlepath_tschedule_tune_objB.json

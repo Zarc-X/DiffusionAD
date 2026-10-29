@@ -633,7 +633,26 @@ def main():
         )
 
         unet_model = build_unet_model(args, device, unet_impl)
-        seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+        seg_model = SegmentationSubNetwork(
+            in_channels=6,
+            out_channels=1,
+            base_channels=get_arg_int(args, "seg_base_channels", 64),
+            arch_mode=str(args.get("seg_arch_mode", "legacy")).strip().lower(),
+            decoder_mode=str(args.get("seg_decoder_mode", "legacy")).strip().lower(),
+            unet3p_stage_channels=get_arg_int(args, "seg_unet3p_stage_channels", 0),
+            boundary_head_enable=get_arg_bool(args, "seg_boundary_head_enable", False),
+            boundary_gate_alpha=get_arg_float(args, "seg_boundary_gate_alpha", 0.5),
+            norm_mode=str(args.get("seg_norm_mode", "batch")).strip().lower(),
+            act_mode=str(args.get("seg_act_mode", "relu")).strip().lower(),
+            groupnorm_groups=get_arg_int(args, "seg_groupnorm_groups", 8),
+            lite_stem_channels=get_arg_int(args, "seg_lite_stem_channels", 16),
+            lite_fuse_channels=get_arg_int(args, "seg_lite_fuse_channels", 0),
+            lite_use_context=get_arg_bool(args, "seg_lite_use_context", True),
+            lite_context_dilations=str(args.get("seg_lite_context_dilations", "1,2")),
+            bottleneck_context_enable=get_arg_bool(args, "seg_bottleneck_context_enable", False),
+            bottleneck_context_dilations=str(args.get("seg_bottleneck_context_dilations", "1,2,3")),
+            bottleneck_context_use_global=get_arg_bool(args, "seg_bottleneck_context_use_global", True),
+        ).to(device)
 
         unet_model.load_state_dict(checkpoint["unet_model_state_dict"])
         seg_model.load_state_dict(checkpoint["seg_model_state_dict"])

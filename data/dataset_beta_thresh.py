@@ -13,6 +13,279 @@ from data.perlin import rand_perlin_2d_np
 texture_list = ['carpet', 'zipper', 'leather', 'tile', 'wood','grid',
                 'Class1', 'Class2', 'Class3', 'Class4', 'Class5',
                  'Class6', 'Class7', 'Class8', 'Class9', 'Class10']
+
+
+LINE_DEFECT_CLASSES = {"screw", "transistor", "toothbrush", "cable"}
+
+
+def _cfg_float(args, key, default):
+    value = args.get(key, default)
+    if value is None or value == "":
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _cfg_int(args, key, default):
+    value = args.get(key, default)
+    if value is None or value == "":
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _cfg_bool(args, key, default):
+    value = args.get(key, default)
+    if value is None or value == "":
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _clip01(x):
+    return np.clip(x, 0.0, 1.0)
+
+
+def _init_synth_cfg(args, classname):
+    cfg = {
+        "mode": str(args.get("anomaly_synth_mode", "legacy")).strip().lower(),
+        "no_anomaly_prob": _cfg_float(args, "anomaly_no_anomaly_prob", 0.5),
+        "perlin_min_scale": _cfg_int(args, "anomaly_perlin_min_scale", 0),
+        "perlin_max_scale": _cfg_int(args, "anomaly_perlin_max_scale", 6),
+        "perlin_threshold": _cfg_float(args, "anomaly_perlin_threshold", 0.5),
+        "mask_try_count": _cfg_int(args, "anomaly_mask_try_count", 50),
+        "multi_scale_count": _cfg_int(args, "anomaly_multi_scale_count", 2),
+        "target_area_min": _cfg_float(args, "anomaly_target_area_min", 0.01),
+        "target_area_max": _cfg_float(args, "anomaly_target_area_max", 0.12),
+        "texture_mix_prob": _cfg_float(args, "anomaly_texture_mix_prob", 0.5),
+        "alpha_min": _cfg_float(args, "anomaly_alpha_min", 0.35),
+        "alpha_max": _cfg_float(args, "anomaly_alpha_max", 0.8),
+        "feather_ksize": _cfg_int(args, "anomaly_feather_ksize", 7),
+        "color_transfer": _cfg_bool(args, "anomaly_color_transfer", True),
+        "line_defect_prob": _cfg_float(args, "anomaly_line_defect_prob", 0.45),
+        "line_count_min": _cfg_int(args, "anomaly_line_count_min", 1),
+        "line_count_max": _cfg_int(args, "anomaly_line_count_max", 3),
+        "line_thickness_min": _cfg_int(args, "anomaly_line_thickness_min", 1),
+        "line_thickness_max": _cfg_int(args, "anomaly_line_thickness_max", 3),
+        "line_length_min": _cfg_float(args, "anomaly_line_length_min", 0.12),
+        "line_length_max": _cfg_float(args, "anomaly_line_length_max", 0.45),
+    }
+
+    cfg["no_anomaly_prob"] = float(np.clip(cfg["no_anomaly_prob"], 0.0, 0.95))
+    cfg["perlin_min_scale"] = max(0, int(cfg["perlin_min_scale"]))
+    cfg["perlin_max_scale"] = max(cfg["perlin_min_scale"] + 1, int(cfg["perlin_max_scale"]))
+    cfg["perlin_threshold"] = float(np.clip(cfg["perlin_threshold"], 0.05, 0.95))
+    cfg["mask_try_count"] = max(1, int(cfg["mask_try_count"]))
+    cfg["multi_scale_count"] = max(1, int(cfg["multi_scale_count"]))
+    cfg["target_area_min"] = float(np.clip(cfg["target_area_min"], 0.001, 0.35))
+    cfg["target_area_max"] = float(np.clip(cfg["target_area_max"], cfg["target_area_min"] + 1e-4, 0.45))
+    cfg["texture_mix_prob"] = float(np.clip(cfg["texture_mix_prob"], 0.0, 1.0))
+    cfg["alpha_min"] = float(np.clip(cfg["alpha_min"], 0.05, 0.95))
+    cfg["alpha_max"] = float(np.clip(cfg["alpha_max"], cfg["alpha_min"], 0.98))
+    cfg["feather_ksize"] = max(1, int(cfg["feather_ksize"]))
+    if cfg["feather_ksize"] % 2 == 0:
+        cfg["feather_ksize"] += 1
+    cfg["line_defect_prob"] = float(np.clip(cfg["line_defect_prob"], 0.0, 1.0))
+    cfg["line_count_min"] = max(1, int(cfg["line_count_min"]))
+    cfg["line_count_max"] = max(cfg["line_count_min"], int(cfg["line_count_max"]))
+    cfg["line_thickness_min"] = max(1, int(cfg["line_thickness_min"]))
+    cfg["line_thickness_max"] = max(cfg["line_thickness_min"], int(cfg["line_thickness_max"]))
+    cfg["line_length_min"] = float(np.clip(cfg["line_length_min"], 0.02, 0.95))
+    cfg["line_length_max"] = float(np.clip(cfg["line_length_max"], cfg["line_length_min"], 1.2))
+
+    cls = str(classname).strip().lower()
+    if cls in LINE_DEFECT_CLASSES:
+        cfg["target_area_min"] = min(cfg["target_area_min"], 0.01)
+        cfg["target_area_max"] = min(cfg["target_area_max"], 0.06)
+    return cfg
+
+
+def _build_patch_shuffle(base_img):
+    high, width = base_img.shape[0], base_img.shape[1]
+    grid_h = max(2, int(high / 8))
+    grid_w = max(2, int(width / 8))
+
+    wi = np.split(base_img, range(grid_w, width, grid_w), axis=1)
+    wi1 = wi[::2]
+    random.shuffle(wi1)
+    wi2 = wi[1::2]
+    random.shuffle(wi2)
+    width_cut_image = np.concatenate((np.concatenate(wi1, axis=1), np.concatenate(wi2, axis=1)), axis=1)
+
+    hi = np.split(width_cut_image, range(grid_h, high, grid_h), axis=0)
+    random.shuffle(hi)
+    hi1 = hi[::2]
+    random.shuffle(hi1)
+    hi2 = hi[1::2]
+    random.shuffle(hi2)
+    return np.concatenate((np.concatenate(hi1, axis=0), np.concatenate(hi2, axis=0)), axis=0)
+
+
+def _color_transfer(source, target, mask_2d):
+    mask = mask_2d > 0.5
+    if int(mask.sum()) < 16:
+        return source
+
+    src_pixels = source[mask]
+    tgt_pixels = target[mask]
+    src_mean = src_pixels.mean(axis=0)
+    src_std = src_pixels.std(axis=0) + 1e-6
+    tgt_mean = tgt_pixels.mean(axis=0)
+    tgt_std = tgt_pixels.std(axis=0) + 1e-6
+
+    transferred = (source - src_mean) / src_std * tgt_std + tgt_mean
+    return _clip01(transferred)
+
+
+def _draw_line_mask(valid_mask, cfg, classname):
+    h, w = valid_mask.shape
+    coords = np.argwhere(valid_mask > 0)
+    if coords.shape[0] == 0:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    cls = str(classname).strip().lower()
+    line_cnt = np.random.randint(cfg["line_count_min"], cfg["line_count_max"] + 1)
+    line_mask = np.zeros((h, w), dtype=np.uint8)
+    min_hw = float(min(h, w))
+
+    for _ in range(line_cnt):
+        yi, xi = coords[np.random.randint(0, coords.shape[0])]
+        theta = np.random.uniform(0.0, np.pi)
+        if cls == "transistor":
+            length_ratio = np.random.uniform(0.06, min(0.30, cfg["line_length_max"]))
+        else:
+            length_ratio = np.random.uniform(cfg["line_length_min"], cfg["line_length_max"])
+        length = max(4, int(length_ratio * min_hw))
+
+        x2 = int(np.clip(xi + length * np.cos(theta), 0, w - 1))
+        y2 = int(np.clip(yi + length * np.sin(theta), 0, h - 1))
+        thickness = np.random.randint(cfg["line_thickness_min"], cfg["line_thickness_max"] + 1)
+        cv2.line(line_mask, (int(xi), int(yi)), (x2, y2), color=1, thickness=thickness)
+
+    line_mask = line_mask * valid_mask.astype(np.uint8)
+    return line_mask
+
+
+def _build_realistic_mask(dataset, thresh):
+    cfg = dataset.synth_cfg
+    h, w = dataset.resize_shape[0], dataset.resize_shape[1]
+    valid_mask = (thresh > 0.5).astype(np.uint8)
+    if int(valid_mask.sum()) < 16:
+        valid_mask = np.ones((h, w), dtype=np.uint8)
+
+    accum = np.zeros((h, w), dtype=np.float32)
+    for _ in range(cfg["multi_scale_count"]):
+        sx = 2 ** np.random.randint(cfg["perlin_min_scale"], cfg["perlin_max_scale"])
+        sy = 2 ** np.random.randint(cfg["perlin_min_scale"], cfg["perlin_max_scale"])
+        noise = rand_perlin_2d_np((h, w), (sx, sy))
+        noise = dataset.rot(image=noise)
+        noise = (noise - noise.min()) / (noise.max() - noise.min() + 1e-6)
+        accum += noise * np.random.uniform(0.7, 1.3)
+
+    accum = accum / float(cfg["multi_scale_count"])
+    cls = str(dataset.classname).strip().lower()
+
+    area_min = cfg["target_area_min"]
+    area_max = cfg["target_area_max"]
+    if cls in {"wood", "carpet", "leather"}:
+        area_min = float(np.clip(area_min * 1.15, 0.001, 0.35))
+        area_max = float(np.clip(area_max * 1.20, area_min + 1e-4, 0.45))
+
+    valid_vals = accum[valid_mask > 0]
+    if valid_vals.size < 32:
+        return np.zeros((h, w), dtype=np.float32)
+
+    target_ratio = np.random.uniform(area_min, area_max)
+    q = float(np.clip(1.0 - target_ratio, 0.0, 1.0))
+    threshold = np.quantile(valid_vals, q)
+    mask = ((accum >= threshold) & (valid_mask > 0)).astype(np.uint8)
+
+    if int(mask.sum()) == 0:
+        mask = ((accum >= cfg["perlin_threshold"]) & (valid_mask > 0)).astype(np.uint8)
+
+    kernel_radius = np.random.randint(1, 4)
+    kernel = np.ones((2 * kernel_radius + 1, 2 * kernel_radius + 1), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    line_prob = cfg["line_defect_prob"]
+    if np.random.rand() < line_prob:
+        line_mask = _draw_line_mask(valid_mask, cfg, dataset.classname)
+        mask = np.maximum(mask, line_mask)
+
+    mask = (mask * valid_mask).astype(np.float32)
+    return mask
+
+
+def _build_anomaly_texture(dataset, image, anomaly_source_path, cv2_image, object_mask):
+    cfg = dataset.synth_cfg
+    h, w = dataset.resize_shape[0], dataset.resize_shape[1]
+    cls = str(dataset.classname).strip().lower()
+
+    force_texture = cls in texture_list
+    use_texture = force_texture or (np.random.rand() < cfg["texture_mix_prob"])
+
+    texture = None
+    if use_texture and anomaly_source_path and os.path.exists(anomaly_source_path):
+        src = cv2.imread(anomaly_source_path)
+        if src is not None:
+            src = cv2.cvtColor(src, cv2.COLOR_BGR2RGB)
+            src = cv2.resize(src, dsize=(w, h))
+            texture = dataset.randAugmenter()(image=src)
+
+    if texture is None:
+        base = cv2_image
+        if base.dtype != np.uint8:
+            base = (np.clip(base, 0, 255)).astype(np.uint8)
+        aug = dataset.randAugmenter()(image=base)
+        texture = _build_patch_shuffle(aug)
+
+    texture = texture.astype(np.float32) / 255.0
+    if cfg["color_transfer"]:
+        texture = _color_transfer(texture, image, object_mask)
+
+    return _clip01(texture)
+
+
+def _realistic_synthetic(dataset, image, thresh, anomaly_source_path, cv2_image):
+    cfg = dataset.synth_cfg
+    no_anomaly = np.random.rand()
+    if no_anomaly < cfg["no_anomaly_prob"]:
+        return image.astype(np.float32), np.zeros((dataset.resize_shape[0], dataset.resize_shape[1], 1), dtype=np.float32), np.array([0.0], dtype=np.float32)
+
+    mask_2d = np.zeros((dataset.resize_shape[0], dataset.resize_shape[1]), dtype=np.float32)
+    for _ in range(cfg["mask_try_count"]):
+        mask_2d = _build_realistic_mask(dataset, thresh)
+        if float(mask_2d.sum()) > 0:
+            break
+
+    if float(mask_2d.sum()) <= 0:
+        return image.astype(np.float32), np.zeros((dataset.resize_shape[0], dataset.resize_shape[1], 1), dtype=np.float32), np.array([0.0], dtype=np.float32)
+
+    anomaly_tex = _build_anomaly_texture(dataset, image, anomaly_source_path, cv2_image, mask_2d)
+
+    feather_ksize = cfg["feather_ksize"]
+    if feather_ksize > 1:
+        soft_mask = cv2.GaussianBlur(mask_2d, (feather_ksize, feather_ksize), 0)
+    else:
+        soft_mask = mask_2d
+    soft_mask = _clip01(soft_mask)
+
+    alpha = np.random.uniform(cfg["alpha_min"], cfg["alpha_max"])
+    alpha_mask = np.expand_dims(alpha * soft_mask, axis=2)
+
+    augmented = image * (1.0 - alpha_mask) + anomaly_tex * alpha_mask
+
+    augmented = _clip01(augmented).astype(np.float32)
+    msk = np.expand_dims((mask_2d > 0).astype(np.float32), axis=2)
+    return augmented, msk, np.array([1.0], dtype=np.float32)
 class MVTecTestDataset(Dataset):
 
     def __init__(self, data_path,classname,img_size):
@@ -114,6 +387,7 @@ class MVTecTrainDataset(Dataset):
                            iaa.Affine(translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)}),]
         
         self.rot = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+        self.synth_cfg = _init_synth_cfg(args, self.classname)
         
 
         #foreground path of textural classes
@@ -169,6 +443,8 @@ class MVTecTrainDataset(Dataset):
 
 
     def perlin_synthetic(self, image, thresh, anomaly_source_path, cv2_image,thresh_path):
+        if self.synth_cfg["mode"] == "realistic":
+            return _realistic_synthetic(self, image, thresh, anomaly_source_path, cv2_image)
 
         no_anomaly = torch.rand(1).numpy()[0]
         if no_anomaly > 0.5:
@@ -385,6 +661,7 @@ class VisATrainDataset(Dataset):
                            iaa.Affine(translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)}),]
         
         self.rot = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+        self.synth_cfg = _init_synth_cfg(args, self.classname)
     
     def __len__(self):
         return len(self.image_paths)
@@ -422,6 +699,8 @@ class VisATrainDataset(Dataset):
 
 
     def perlin_synthetic(self, image, thresh, anomaly_source_path, cv2_image,thresh_path):
+        if self.synth_cfg["mode"] == "realistic":
+            return _realistic_synthetic(self, image, thresh, anomaly_source_path, cv2_image)
 
         no_anomaly = torch.rand(1).numpy()[0]
         if no_anomaly > 0.5:
@@ -644,6 +923,7 @@ class DAGMTrainDataset(Dataset):
                            iaa.Affine(translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)}),]
         
         self.rot = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+        self.synth_cfg = _init_synth_cfg(args, self.classname)
         
         #foreground path of textural classes
         foreground_path = os.path.join(args["mvtec_root_path"],'carpet')
@@ -691,6 +971,8 @@ class DAGMTrainDataset(Dataset):
 
 
     def perlin_synthetic(self, image, thresh, anomaly_source_path, cv2_image,thresh_path):
+        if self.synth_cfg["mode"] == "realistic":
+            return _realistic_synthetic(self, image, thresh, anomaly_source_path, cv2_image)
 
         no_anomaly = torch.rand(1).numpy()[0]
         if no_anomaly > 0.5:
@@ -911,6 +1193,7 @@ class MPDDTrainDataset(Dataset):
                            iaa.Affine(translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)}),]
         
         self.rot = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+        self.synth_cfg = _init_synth_cfg(args, self.classname)
         
         
 
@@ -950,6 +1233,8 @@ class MPDDTrainDataset(Dataset):
 
 
     def perlin_synthetic(self, image, thresh, anomaly_source_path, cv2_image,thresh_path):
+        if self.synth_cfg["mode"] == "realistic":
+            return _realistic_synthetic(self, image, thresh, anomaly_source_path, cv2_image)
 
         no_anomaly = torch.rand(1).numpy()[0]
         if no_anomaly > 0.5:

@@ -451,7 +451,26 @@ def train_one_class(training_loader, testing_loader, args, sub_class, class_type
         img_channels=in_channels,
     )
 
-    seg_model = SegmentationSubNetwork(in_channels=6, out_channels=1).to(device)
+    seg_model = SegmentationSubNetwork(
+        in_channels=6,
+        out_channels=1,
+        base_channels=get_arg_int(args, "seg_base_channels", 64),
+        arch_mode=str(args.get("seg_arch_mode", "legacy")).strip().lower(),
+        decoder_mode=str(args.get("seg_decoder_mode", "legacy")).strip().lower(),
+        unet3p_stage_channels=get_arg_int(args, "seg_unet3p_stage_channels", 0),
+        boundary_head_enable=get_arg_bool(args, "seg_boundary_head_enable", False),
+        boundary_gate_alpha=get_arg_float(args, "seg_boundary_gate_alpha", 0.5),
+        norm_mode=str(args.get("seg_norm_mode", "batch")).strip().lower(),
+        act_mode=str(args.get("seg_act_mode", "relu")).strip().lower(),
+        groupnorm_groups=get_arg_int(args, "seg_groupnorm_groups", 8),
+        lite_stem_channels=get_arg_int(args, "seg_lite_stem_channels", 16),
+        lite_fuse_channels=get_arg_int(args, "seg_lite_fuse_channels", 0),
+        lite_use_context=get_arg_bool(args, "seg_lite_use_context", True),
+        lite_context_dilations=str(args.get("seg_lite_context_dilations", "1,2")),
+        bottleneck_context_enable=get_arg_bool(args, "seg_bottleneck_context_enable", False),
+        bottleneck_context_dilations=str(args.get("seg_bottleneck_context_dilations", "1,2,3")),
+        bottleneck_context_use_global=get_arg_bool(args, "seg_bottleneck_context_use_global", True),
+    ).to(device)
 
     optimizer_ddpm = optim.Adam(
         unet_model.parameters(), lr=args["diffusion_lr"], weight_decay=args["weight_decay"]
@@ -470,6 +489,9 @@ def train_one_class(training_loader, testing_loader, args, sub_class, class_type
 
     loss_focal = BinaryFocalLoss().to(device)
     loss_smL1 = nn.SmoothL1Loss().to(device)
+    train_loss_w_noise = get_arg_float(args, "train_loss_w_noise", 1.0)
+    train_loss_w_focal = get_arg_float(args, "train_loss_w_focal", 5.0)
+    train_loss_w_smooth_l1 = get_arg_float(args, "train_loss_w_smooth_l1", 1.0)
 
     best_image_auroc = 0.0
     best_pixel_auroc = 0.0
@@ -516,6 +538,11 @@ def train_one_class(training_loader, testing_loader, args, sub_class, class_type
             f"eval_interval={eval_interval}"
         )
 
+    print(
+        f"[{sub_class}] Train loss weights: "
+        f"noise={train_loss_w_noise}, focal={train_loss_w_focal}, smooth_l1={train_loss_w_smooth_l1}"
+    )
+
     for epoch in range(0, args["EPOCHS"]):
         last_epoch_ran = epoch + 1
         unet_model.train()
@@ -535,7 +562,11 @@ def train_one_class(training_loader, testing_loader, args, sub_class, class_type
 
             focal_loss = loss_focal(pred_mask, anomaly_mask)
             smL1_loss = loss_smL1(pred_mask, anomaly_mask)
-            loss = noise_loss + 5 * focal_loss + smL1_loss
+            loss = (
+                train_loss_w_noise * noise_loss
+                + train_loss_w_focal * focal_loss
+                + train_loss_w_smooth_l1 * smL1_loss
+            )
 
             optimizer_ddpm.zero_grad()
             optimizer_seg.zero_grad()
@@ -773,6 +804,48 @@ def main():
     print("Mamba mode:", args["recon_mamba_mode"])
     print("Seed:", run_seed)
     print("Deterministic:", deterministic)
+    print(
+        "Anomaly synthesis:",
+        {
+            "mode": str(args.get("anomaly_synth_mode", "legacy")).strip().lower(),
+            "no_anomaly_prob": get_arg_float(args, "anomaly_no_anomaly_prob", 0.5),
+            "perlin_min_scale": get_arg_int(args, "anomaly_perlin_min_scale", 0),
+            "perlin_max_scale": get_arg_int(args, "anomaly_perlin_max_scale", 6),
+            "perlin_threshold": get_arg_float(args, "anomaly_perlin_threshold", 0.5),
+            "multi_scale_count": get_arg_int(args, "anomaly_multi_scale_count", 2),
+            "target_area": [
+                get_arg_float(args, "anomaly_target_area_min", 0.01),
+                get_arg_float(args, "anomaly_target_area_max", 0.12),
+            ],
+            "texture_mix_prob": get_arg_float(args, "anomaly_texture_mix_prob", 0.5),
+            "alpha": [
+                get_arg_float(args, "anomaly_alpha_min", 0.35),
+                get_arg_float(args, "anomaly_alpha_max", 0.8),
+            ],
+            "line_defect_prob": get_arg_float(args, "anomaly_line_defect_prob", 0.45),
+        },
+    )
+    print(
+        "Segmentation arch:",
+        {
+            "mode": str(args.get("seg_arch_mode", "legacy")).strip().lower(),
+            "decoder_mode": str(args.get("seg_decoder_mode", "legacy")).strip().lower(),
+            "base_channels": get_arg_int(args, "seg_base_channels", 64),
+            "unet3p_stage_channels": get_arg_int(args, "seg_unet3p_stage_channels", 0),
+            "boundary_head_enable": get_arg_bool(args, "seg_boundary_head_enable", False),
+            "boundary_gate_alpha": get_arg_float(args, "seg_boundary_gate_alpha", 0.5),
+            "norm_mode": str(args.get("seg_norm_mode", "batch")).strip().lower(),
+            "act_mode": str(args.get("seg_act_mode", "relu")).strip().lower(),
+            "groupnorm_groups": get_arg_int(args, "seg_groupnorm_groups", 8),
+            "lite_stem_channels": get_arg_int(args, "seg_lite_stem_channels", 16),
+            "lite_fuse_channels": get_arg_int(args, "seg_lite_fuse_channels", 0),
+            "lite_use_context": get_arg_bool(args, "seg_lite_use_context", True),
+            "lite_context_dilations": str(args.get("seg_lite_context_dilations", "1,2")),
+            "bottleneck_context_enable": get_arg_bool(args, "seg_bottleneck_context_enable", False),
+            "bottleneck_context_dilations": str(args.get("seg_bottleneck_context_dilations", "1,2,3")),
+            "bottleneck_context_use_global": get_arg_bool(args, "seg_bottleneck_context_use_global", True),
+        },
+    )
     if get_arg_bool(args, "diffusion_single_path", False):
         print("Single-path proxy mode:", args.get("single_path_proxy_mode", "self"))
         print(
